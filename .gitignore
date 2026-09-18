@@ -10,14 +10,7 @@ data/video/
 data/audio/
 data/video_frames/
 
-# Large Model Weights (>100MB violates GitHub limits)
-models/*.pt
-checkpoints/*.pt
-*.bin
-*.pt
-*.onnx
-*.safetensors
-models/
+# Tracked via Git LFS in models/
 checkpoints/
 features/
 
