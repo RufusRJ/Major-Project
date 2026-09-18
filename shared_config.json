@@ -1,0 +1,25 @@
+{
+  "project_root": ".",
+  "seed": 42,
+  "image": {
+    "img_size": 224,
+    "batch_size": 16,
+    "backbone": "efficientnet_b4"
+  },
+  "video": {
+    "num_frames": 16,
+    "frame_size": 224,
+    "batch_size": 8,
+    "cnn_feature_dim": 512,
+    "lstm_hidden": 256
+  },
+  "audio": {
+    "sample_rate": 16000,
+    "max_audio_seconds": 4,
+    "batch_size": 16,
+    "wavlm_checkpoint": "microsoft/wavlm-base-plus"
+  },
+  "fusion": {
+    "projection_dim": 256
+  }
+}
