@@ -212,7 +212,11 @@ MAX_SAMPLES = SAMPLE_RATE * CFG["audio"]["max_audio_seconds"]
 # ==============================================================================
 
 def predict_image(image_bytes):
-    img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+    try:
+        img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+    except Exception:
+        raise ValueError("Invalid image file format. Please upload a valid JPG, PNG, or WEBP image file.")
+
     tensor = img_transform(img).unsqueeze(0).to(device)
     with torch.no_grad():
         features = img_model.extract_features(tensor)
@@ -244,10 +248,20 @@ def predict_video(video_bytes):
 
     try:
         cap = cv2.VideoCapture(tmp_path)
+        if not cap.isOpened():
+            raise ValueError("Invalid video file format. Unable to open file stream.")
+
         total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        ret, first_frame = cap.read()
+        if not ret or first_frame is None:
+            cap.release()
+            raise ValueError("Invalid video file format or unreadable video codec. Please upload a valid MP4, AVI, or MOV video file (audio-only MP3 files cannot be processed by the Video branch).")
+
+        # Reset capture to start
+        cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
         if total_frames <= 0:
             total_frames = 30
-        
+
         indices = np.linspace(0, max(total_frames - 1, 0), NUM_FRAMES).astype(int)
         frames = []
         for i in range(total_frames):
@@ -258,9 +272,10 @@ def predict_video(video_bytes):
                 frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
                 frames.append(frame_transform(frame))
         cap.release()
-        
+
         if len(frames) == 0:
-            frames = [torch.zeros(3, FRAME_SIZE, FRAME_SIZE) for _ in range(NUM_FRAMES)]
+            raise ValueError("No valid video frames could be extracted. Please upload a valid MP4/AVI/MOV video file.")
+            
         while len(frames) < NUM_FRAMES:
             frames.append(frames[-1])
             
@@ -290,7 +305,10 @@ def predict_video(video_bytes):
         }
     finally:
         if os.path.exists(tmp_path):
-            os.remove(tmp_path)
+            try:
+                os.remove(tmp_path)
+            except Exception:
+                pass
 
 def predict_audio(audio_bytes):
     with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmp:
@@ -298,7 +316,14 @@ def predict_audio(audio_bytes):
         tmp_path = tmp.name
 
     try:
-        wav, _ = librosa.load(tmp_path, sr=SAMPLE_RATE, mono=True)
+        try:
+            wav, _ = librosa.load(tmp_path, sr=SAMPLE_RATE, mono=True)
+        except Exception:
+            raise ValueError("Invalid audio file format. Please upload a valid WAV, MP3, or FLAC audio file.")
+
+        if len(wav) == 0:
+            raise ValueError("Audio file is empty or unreadable.")
+
         if len(wav) > MAX_SAMPLES:
             wav = wav[:MAX_SAMPLES]
         else:
@@ -337,7 +362,10 @@ def predict_audio(audio_bytes):
         }
     finally:
         if os.path.exists(tmp_path):
-            os.remove(tmp_path)
+            try:
+                os.remove(tmp_path)
+            except Exception:
+                pass
 
 # ==============================================================================
 # HTML Front-End Template
