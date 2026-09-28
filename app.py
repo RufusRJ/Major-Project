@@ -487,7 +487,7 @@ HTML_CONTENT = """<!DOCTYPE html>
         .conf-badge { font-size: 1.1rem; font-weight: 600; color: #fff; }
 
         /* Metrics grid */
-        .metrics-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; margin-bottom: 1.5rem; }
+        .metrics-grid { display: none; }
         .metric-box { background: rgba(255,255,255,0.03); padding: 12px; border-radius: 8px; border: 1px solid var(--border-color); text-align: center; }
         .metric-val { font-size: 1.1rem; font-weight: 700; color: var(--accent-blue); margin-top: 4px; }
         .metric-lbl { font-size: 0.75rem; color: var(--text-muted); }
