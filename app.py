@@ -168,6 +168,62 @@ if os.path.exists(vid_ckpt_path):
     print("  -> Video model loaded successfully from models/cnn_lstm_video.pt")
 vid_model.eval()
 
+class ModalityProjection(nn.Module):
+    def __init__(self, in_dim, proj_dim=256):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(in_dim, proj_dim),
+            nn.LayerNorm(proj_dim),
+            nn.ReLU(),
+            nn.Dropout(0.2)
+        )
+    def forward(self, x):
+        return self.net(x)
+
+class MultimodalFusionNetwork(nn.Module):
+    def __init__(self, img_dim=1792, vid_dim=256, aud_dim=768, proj_dim=256, num_classes=2):
+        super().__init__()
+        self.proj_img = ModalityProjection(img_dim, proj_dim)
+        self.proj_vid = ModalityProjection(vid_dim, proj_dim)
+        self.proj_aud = ModalityProjection(aud_dim, proj_dim)
+        
+        self.attn_gate = nn.Sequential(
+            nn.Linear(proj_dim * 3, 64),
+            nn.ReLU(),
+            nn.Linear(64, 3),
+            nn.Softmax(dim=-1)
+        )
+        
+        fused_dim = proj_dim * 3
+        self.classifier = nn.Sequential(
+            nn.Linear(fused_dim, 256),
+            nn.LayerNorm(256),
+            nn.ReLU(),
+            nn.Dropout(0.3),
+            nn.Linear(256, 128),
+            nn.ReLU(),
+            nn.Linear(128, num_classes)
+        )
+        
+    def extract_fusion_embedding(self, f_img, f_vid, f_aud):
+        p_img = self.proj_img(f_img)
+        p_vid = self.proj_vid(f_vid)
+        p_aud = self.proj_aud(f_aud)
+        
+        concat_feat = torch.cat([p_img, p_vid, p_aud], dim=-1)
+        attn_weights = self.attn_gate(concat_feat)
+        
+        p_img_w = p_img * attn_weights[:, 0:1]
+        p_vid_w = p_vid * attn_weights[:, 1:2]
+        p_aud_w = p_aud * attn_weights[:, 2:3]
+        
+        fused = torch.cat([p_img_w, p_vid_w, p_aud_w], dim=-1)
+        return fused, attn_weights
+        
+    def forward(self, f_img, f_vid, f_aud):
+        fused, _ = self.extract_fusion_embedding(f_img, f_vid, f_aud)
+        return self.classifier(fused)
+
 print("[Init] Loading Audio Model (DavidCombei/wavLM-base-Deepfake_V2)...")
 WAVLM_CKPT = "DavidCombei/wavLM-base-Deepfake_V2"
 audio_processor = AutoFeatureExtractor.from_pretrained(WAVLM_CKPT)
@@ -184,6 +240,15 @@ if os.path.exists(aud_ckpt_path):
         print(f"  -> Audio model loaded directly from HuggingFace ({e})")
 aud_model = aud_model.to(device)
 aud_model.eval()
+
+print("[Init] Loading Multimodal Fusion Model...")
+fusion_model = MultimodalFusionNetwork().to(device)
+fusion_ckpt_path = os.path.join(MODELS_DIR, "multimodal_fusion.pt")
+if os.path.exists(fusion_ckpt_path):
+    ckpt = torch.load(fusion_ckpt_path, map_location=device, weights_only=False)
+    fusion_model.load_state_dict(ckpt["model_state_dict"])
+    print("  -> Fusion model loaded successfully from models/multimodal_fusion.pt (Phase 5 Active!)")
+fusion_model.eval()
 
 # Image Preprocessing Transforms
 IMG_SIZE = CFG["image"]["img_size"]
