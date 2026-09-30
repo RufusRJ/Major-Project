@@ -269,12 +269,7 @@ def predict_image(image_bytes):
         "confidence": round(max(real_prob, fake_prob) * 100, 2),
         "probabilities": {"real": round(real_prob, 4), "fake": round(fake_prob, 4)},
         "feature_dim": features.shape[1],
-        "feature_sample": feat_sample,
-        "metrics": {
-            "texture_anomaly": round(fake_prob * 88 + np.random.uniform(2, 10), 1),
-            "edge_inconsistency": round(fake_prob * 79 + np.random.uniform(3, 12), 1),
-            "compression_artifact": round(fake_prob * 92 + np.random.uniform(1, 7), 1)
-        }
+        "feature_sample": feat_sample
     }
 
 def predict_video(video_bytes):
@@ -331,12 +326,7 @@ def predict_video(video_bytes):
             "confidence": round(max(real_prob, fake_prob) * 100, 2),
             "probabilities": {"real": round(real_prob, 4), "fake": round(fake_prob, 4)},
             "feature_dim": features.shape[1],
-            "feature_sample": feat_sample,
-            "metrics": {
-                "temporal_jitter": round(fake_prob * 85 + np.random.uniform(2, 9), 1),
-                "facial_warp_score": round(fake_prob * 91 + np.random.uniform(1, 8), 1),
-                "frame_flicker_index": round(fake_prob * 77 + np.random.uniform(4, 11), 1)
-            }
+            "feature_sample": feat_sample
         }
     finally:
         if os.path.exists(tmp_path):
@@ -388,12 +378,7 @@ def predict_audio(audio_bytes):
             "confidence": round(max(real_prob, fake_prob) * 100, 2),
             "probabilities": {"real": round(real_prob, 4), "fake": round(fake_prob, 4)},
             "feature_dim": 768,
-            "feature_sample": feat_sample,
-            "metrics": {
-                "vocoder_artifact": round(fake_prob * 89 + np.random.uniform(2, 8), 1),
-                "spectral_anomaly": round(fake_prob * 82 + np.random.uniform(3, 10), 1),
-                "synthetic_pitch_flatness": round(fake_prob * 76 + np.random.uniform(4, 12), 1)
-            }
+            "feature_sample": feat_sample
         }
     finally:
         if os.path.exists(tmp_path):
@@ -402,7 +387,7 @@ def predict_audio(audio_bytes):
             except Exception:
                 pass
 
-def predict_multimodal(video_bytes, audio_bytes=None, image_bytes=None):
+def predict_multimodal(video_bytes, audio_bytes=None):
     tmp_vid_path = None
     tmp_aud_path = None
     
@@ -453,21 +438,11 @@ def predict_multimodal(video_bytes, audio_bytes=None, image_bytes=None):
             vid_probs = torch.softmax(vid_logits, dim=1)[0]
             vid_fake_p = float(vid_probs[1].item())
 
-        # 2. Extract Image Features (F_image)
-        if image_bytes and len(image_bytes) > 0:
-            try:
-                img_pil = Image.open(io.BytesIO(image_bytes)).convert("RGB")
-            except Exception:
-                img_pil = raw_frames_pil[len(raw_frames_pil) // 2]
-        else:
-            img_pil = raw_frames_pil[len(raw_frames_pil) // 2]
-
+        # 2. Keyframe Image Representation (F_image extracted from middle video frame)
+        img_pil = raw_frames_pil[len(raw_frames_pil) // 2]
         img_tensor = img_transform(img_pil).unsqueeze(0).to(device)
         with torch.no_grad():
             f_img = img_model.extract_features(img_tensor)
-            img_logits = img_model.classifier(f_img)
-            img_probs = torch.softmax(img_logits, dim=1)[0]
-            img_fake_p = float(img_probs[1].item())
 
         # 3. Extract Audio Features (F_audio)
         wav = None
@@ -506,7 +481,7 @@ def predict_multimodal(video_bytes, audio_bytes=None, image_bytes=None):
             else:
                 f_aud = torch.zeros(1, 768, device=device)
 
-        # 4. Multimodal Feature Fusion Network Inference
+        # 4. Multimodal Feature Fusion Model Inference
         with torch.no_grad():
             fused_emb, attn_weights = fusion_model.extract_fusion_embedding(f_img, f_vid, f_aud)
             fusion_logits = fusion_model.classifier(fused_emb)
@@ -519,30 +494,28 @@ def predict_multimodal(video_bytes, audio_bytes=None, image_bytes=None):
         w_vid = float(attn_weights[0, 1].item())
         w_aud = float(attn_weights[0, 2].item())
 
+        w_video_comb = w_img + w_vid
+        total_w = w_video_comb + w_aud + 1e-6
+        pct_video = round((w_video_comb / total_w) * 100, 1)
+        pct_audio = round((w_aud / total_w) * 100, 1)
+
         feat_sample = fused_emb[0][:20].cpu().numpy().tolist()
 
         return {
-            "modality": "Multimodal Feature Fusion (Image + Video + Audio)",
+            "modality": "Multimodal Feature Fusion (Video + Audio)",
             "prediction": "DEEPFAKE" if fake_prob > 0.5 else "REAL",
             "confidence": round(max(real_prob, fake_prob) * 100, 2),
             "probabilities": {"real": round(real_prob, 4), "fake": round(fake_prob, 4)},
             "attention_weights": {
-                "image": round(w_img * 100, 1),
-                "video": round(w_vid * 100, 1),
-                "audio": round(w_aud * 100, 1)
+                "video": pct_video,
+                "audio": pct_audio
             },
             "branch_predictions": {
-                "image": {"prediction": "DEEPFAKE" if img_fake_p > 0.5 else "REAL", "confidence": round(max(img_fake_p, 1-img_fake_p)*100, 1)},
                 "video": {"prediction": "DEEPFAKE" if vid_fake_p > 0.5 else "REAL", "confidence": round(max(vid_fake_p, 1-vid_fake_p)*100, 1)},
-                "audio": {"prediction": "DEEPFAKE" if aud_fake_p > 0.5 else "REAL", "confidence": round(max(aud_fake_p, 1-aud_fake_p)*100, 1)},
+                "audio": {"prediction": "DEEPFAKE" if aud_fake_p > 0.5 else "REAL", "confidence": round(max(aud_fake_p, 1-aud_fake_p)*100, 1)}
             },
             "feature_dim": fused_emb.shape[1],
-            "feature_sample": feat_sample,
-            "metrics": {
-                "cross_modal_consensus": round(fake_prob * 94 + np.random.uniform(2, 5), 1),
-                "attention_entropy": round((1.0 - max(w_img, w_vid, w_aud)) * 100, 1),
-                "modality_discrepancy": round(abs(vid_fake_p - aud_fake_p) * 100, 1)
-            }
+            "feature_sample": feat_sample
         }
     finally:
         if tmp_vid_path and os.path.exists(tmp_vid_path):
@@ -710,18 +683,14 @@ HTML_CONTENT = """<!DOCTYPE html>
         .attn-header { display: flex; justify-content: space-between; font-size: 0.85rem; color: var(--text-main); margin-bottom: 4px; }
         .attn-bar-bg { background: rgba(255,255,255,0.06); height: 8px; border-radius: 4px; overflow: hidden; }
         .attn-bar-fill { height: 100%; border-radius: 4px; transition: width 0.6s ease; }
-        .img-fill { background: linear-gradient(90deg, #00d2ff, #00e676); }
         .vid-fill { background: linear-gradient(90deg, #7000ff, #00d2ff); }
         .aud-fill { background: linear-gradient(90deg, #ff007f, #7000ff); }
 
-        /* Individual Branch Predictions */
-        .branch-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; margin-bottom: 1.5rem; display: none; }
-        .branch-card { background: rgba(255,255,255,0.03); border: 1px solid var(--border-color); border-radius: 8px; padding: 10px; text-align: center; }
-        .branch-title { font-size: 0.75rem; color: var(--text-muted); margin-bottom: 4px; }
-        .branch-pred { font-size: 0.9rem; font-weight: 700; }
-
-        /* Metrics grid */
-        .metrics-grid { display: none; }
+        /* Individual Branch Consensus Grid (2 Columns: Video + Audio) */
+        .branch-grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 12px; margin-bottom: 1.5rem; display: none; }
+        .branch-card { background: rgba(255,255,255,0.03); border: 1px solid var(--border-color); border-radius: 8px; padding: 12px; text-align: center; }
+        .branch-title { font-size: 0.8rem; color: var(--text-muted); margin-bottom: 6px; font-weight: 500; }
+        .branch-pred { font-size: 1rem; font-weight: 700; }
 
         /* Embedding Box */
         .embedding-box { background: rgba(0,0,0,0.4); padding: 12px; border-radius: 8px; border: 1px solid var(--border-color); }
@@ -788,12 +757,12 @@ HTML_CONTENT = """<!DOCTYPE html>
                     <input type="file" id="file-input" onchange="handleFileSelect(event)">
                 </div>
 
-                <!-- Secondary Optional Audio / Image Dropzones for Multimodal Fusion -->
+                <!-- Secondary Optional Audio Dropzone for Multimodal Fusion -->
                 <div class="optional-inputs" id="optional-inputs">
                     <div style="border-top:1px dashed var(--border-color); margin: 1rem 0; padding-top: 1rem;">
-                        <span class="sub-input-label">🎙️ Optional Audio Track Input (WAV, MP3, FLAC)</span>
+                        <span class="sub-input-label">🎙️ Optional Custom Audio Track (WAV, MP3, FLAC)</span>
                         <div class="dropzone" style="padding:1rem;" onclick="document.getElementById('aud-file-input').click()">
-                            <div class="dropzone-text" id="aud-file-name">Click to select separate Audio track (If empty, audio will be extracted from Video)</div>
+                            <div class="dropzone-text" id="aud-file-name">Click to select separate Audio track (If left empty, audio is automatically extracted from Video)</div>
                             <input type="file" id="aud-file-input" accept="audio/*" onchange="handleSubFileSelect(event, 'aud')">
                         </div>
                     </div>
@@ -832,42 +801,33 @@ HTML_CONTENT = """<!DOCTYPE html>
                         <div class="conf-badge" id="conf-badge">94.2% Confident</div>
                     </div>
 
-                    <!-- Multimodal Cross-Attention Weighting (Phase 5) -->
+                    <!-- Multimodal Cross-Attention Weighting (Phase 5: Video + Audio) -->
                     <div class="attention-box" id="attention-box">
                         <div style="font-size:0.85rem; font-weight:600; color:var(--text-muted); margin-bottom:10px; display:flex; justify-content:space-between;">
                             <span>⚡ Adaptive Attention Weighting (Phase 5)</span>
-                            <span style="color:var(--accent-pink)">Dynamic Gating</span>
+                            <span style="color:var(--accent-pink)">Video + Audio Fusion</span>
                         </div>
                         <div class="attn-item">
-                            <div class="attn-header"><span>🖼️ Image Attention (Spatial)</span><span id="attn-img-val">33.3%</span></div>
-                            <div class="attn-bar-bg"><div class="attn-bar-fill img-fill" id="attn-img-bar" style="width:33.3%"></div></div>
+                            <div class="attn-header"><span>📹 Video Stream Attention (Visual)</span><span id="attn-vid-val">50.0%</span></div>
+                            <div class="attn-bar-bg"><div class="attn-bar-fill vid-fill" id="attn-vid-bar" style="width:50.0%"></div></div>
                         </div>
                         <div class="attn-item">
-                            <div class="attn-header"><span>📹 Video Attention (Temporal)</span><span id="attn-vid-val">33.3%</span></div>
-                            <div class="attn-bar-bg"><div class="attn-bar-fill vid-fill" id="attn-vid-bar" style="width:33.3%"></div></div>
-                        </div>
-                        <div class="attn-item">
-                            <div class="attn-header"><span>🎙️ Audio Attention (Acoustic)</span><span id="attn-aud-val">33.3%</span></div>
-                            <div class="attn-bar-bg"><div class="attn-bar-fill aud-fill" id="attn-aud-bar" style="width:33.3%"></div></div>
+                            <div class="attn-header"><span>🎙️ Audio Track Attention (Acoustic)</span><span id="attn-aud-val">50.0%</span></div>
+                            <div class="attn-bar-bg"><div class="attn-bar-fill aud-fill" id="attn-aud-bar" style="width:50.0%"></div></div>
                         </div>
                     </div>
 
-                    <!-- Individual Branch Consensus Grid -->
+                    <!-- Individual Branch Predictions (Video & Audio) -->
                     <div class="branch-grid" id="branch-grid">
                         <div class="branch-card">
-                            <div class="branch-title">Image Branch</div>
-                            <div class="branch-pred" id="b-img-pred">REAL</div>
-                            <div class="branch-title" id="b-img-conf" style="margin-top:2px;">91.2%</div>
-                        </div>
-                        <div class="branch-card">
-                            <div class="branch-title">Video Branch</div>
+                            <div class="branch-title">📹 Video Branch (CNN-LSTM)</div>
                             <div class="branch-pred" id="b-vid-pred">REAL</div>
-                            <div class="branch-title" id="b-vid-conf" style="margin-top:2px;">94.5%</div>
+                            <div class="branch-title" id="b-vid-conf" style="margin-top:4px;">94.5%</div>
                         </div>
                         <div class="branch-card">
-                            <div class="branch-title">Audio Branch</div>
+                            <div class="branch-title">🎙️ Audio Branch (WavLM)</div>
                             <div class="branch-pred" id="b-aud-pred">REAL</div>
-                            <div class="branch-title" id="b-aud-conf" style="margin-top:2px;">88.0%</div>
+                            <div class="branch-title" id="b-aud-conf" style="margin-top:4px;">88.0%</div>
                         </div>
                     </div>
 
@@ -1066,9 +1026,6 @@ HTML_CONTENT = """<!DOCTYPE html>
                 branchGrid.style.display = 'grid';
 
                 const aw = data.attention_weights;
-                document.getElementById('attn-img-val').innerText = aw.image + '%';
-                document.getElementById('attn-img-bar').style.width = aw.image + '%';
-
                 document.getElementById('attn-vid-val').innerText = aw.video + '%';
                 document.getElementById('attn-vid-bar').style.width = aw.video + '%';
 
@@ -1077,20 +1034,15 @@ HTML_CONTENT = """<!DOCTYPE html>
 
                 if (data.branch_predictions) {
                     const bp = data.branch_predictions;
-                    const elImg = document.getElementById('b-img-pred');
-                    elImg.innerText = bp.image.prediction;
-                    elImg.style.color = bp.image.prediction === 'DEEPFAKE' ? 'var(--fake-red)' : 'var(--real-green)';
-                    document.getElementById('b-img-conf').innerText = bp.image.confidence + '%';
-
                     const elVid = document.getElementById('b-vid-pred');
                     elVid.innerText = bp.video.prediction;
                     elVid.style.color = bp.video.prediction === 'DEEPFAKE' ? 'var(--fake-red)' : 'var(--real-green)';
-                    document.getElementById('b-vid-conf').innerText = bp.video.confidence + '%';
+                    document.getElementById('b-vid-conf').innerText = bp.video.confidence + '% Confident';
 
                     const elAud = document.getElementById('b-aud-pred');
                     elAud.innerText = bp.audio.prediction;
                     elAud.style.color = bp.audio.prediction === 'DEEPFAKE' ? 'var(--fake-red)' : 'var(--real-green)';
-                    document.getElementById('b-aud-conf').innerText = bp.audio.confidence + '%';
+                    document.getElementById('b-aud-conf').innerText = bp.audio.confidence + '% Confident';
                 }
             } else {
                 attnBox.style.display = 'none';
@@ -1152,8 +1104,7 @@ class ForensicRequestHandler(BaseHTTPRequestHandler):
                     parsed_files = parse_multipart(file_bytes, ct)
                     vid_b = parsed_files.get("video", {}).get("content") or parsed_files.get("file", {}).get("content")
                     aud_b = parsed_files.get("audio", {}).get("content")
-                    img_b = parsed_files.get("image", {}).get("content")
-                    result = predict_multimodal(vid_b, aud_b, img_b)
+                    result = predict_multimodal(vid_b, aud_b)
                 else:
                     result = predict_multimodal(file_bytes)
             else:
