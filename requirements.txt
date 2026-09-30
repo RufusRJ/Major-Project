@@ -1,0 +1,14 @@
+# Multimodal Deepfake Forensic Workbench - Dependencies
+torch
+torchvision
+timm
+opencv-python
+librosa
+transformers
+soundfile
+pillow
+numpy
+scikit-learn
+scipy
+# Optional GPU Acceleration for AMD Radeon GPUs:
+# torch-directml
