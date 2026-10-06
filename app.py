@@ -487,8 +487,18 @@ def predict_multimodal(video_bytes, audio_bytes=None):
             fusion_logits = fusion_model.classifier(fused_emb)
             fusion_probs = torch.softmax(fusion_logits, dim=1)[0]
 
-        real_prob = float(fusion_probs[0].item())
-        fake_prob = float(fusion_probs[1].item())
+        raw_real_prob = float(fusion_probs[0].item())
+        raw_fake_prob = float(fusion_probs[1].item())
+
+        # Forensic Security Gating Rule:
+        # In media forensics, if ANY individual stream (Video or Audio) is detected as DEEPFAKE (> 50%),
+        # the overall file is compromised and MUST be flagged as DEEPFAKE.
+        if vid_fake_p > 0.5 or aud_fake_p > 0.5:
+            fake_prob = max(raw_fake_prob, vid_fake_p if vid_fake_p > 0.5 else 0.0, aud_fake_p if aud_fake_p > 0.5 else 0.0)
+            real_prob = 1.0 - fake_prob
+        else:
+            real_prob = raw_real_prob
+            fake_prob = raw_fake_prob
 
         w_img = float(attn_weights[0, 0].item())
         w_vid = float(attn_weights[0, 1].item())
