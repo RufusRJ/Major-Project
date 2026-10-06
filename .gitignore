@@ -14,9 +14,11 @@ data/video_frames/
 checkpoints/
 features/
 
-# System / IDE / Cache
+# System / IDE / Cache / Backups
 .idea/
 .vscode/
 .cache/
 .DS_Store
 *.log
+*_backup.pt
+
