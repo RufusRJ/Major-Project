@@ -13,6 +13,7 @@ data/video_frames/
 # Tracked via Git LFS in models/
 checkpoints/
 features/
+models/*_backup.pt
 
 # System / IDE / Cache / Backups
 .idea/
@@ -21,4 +22,5 @@ features/
 .DS_Store
 *.log
 *_backup.pt
+
 
