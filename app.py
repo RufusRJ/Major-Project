@@ -24,6 +24,9 @@ import timm
 import cv2
 import librosa
 from transformers import WavLMModel, Wav2Vec2FeatureExtractor, AutoFeatureExtractor, AutoModelForAudioClassification
+import forensics
+
+LATEST_EVALUATION = {}
 
 PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
 MODELS_DIR = os.path.join(PROJECT_ROOT, "models")
@@ -253,6 +256,7 @@ def predict_image(image_bytes):
     except Exception:
         raise ValueError("Invalid image file format. Please upload a valid JPG, PNG, or WEBP image file.")
 
+    img_np = np.array(img)
     tensor = img_transform(img).unsqueeze(0).to(device)
     with torch.no_grad():
         features = img_model.extract_features(tensor)
@@ -261,15 +265,53 @@ def predict_image(image_bytes):
     
     real_prob = float(probs[0].item())
     fake_prob = float(probs[1].item())
+    verdict = "DEEPFAKE" if fake_prob > 0.5 else "REAL"
+    confidence = round(max(real_prob, fake_prob) * 100, 2)
     feat_sample = features[0][:20].cpu().numpy().tolist()
-    
+
+    # Phase 6: XAI Grad-CAM, FFT & Metadata Analysis
+    target_layer = img_model.backbone.conv_head
+    gradcam = forensics.GradCAM(img_model, target_layer)
+    target_class = 1 if fake_prob > 0.5 else 0
+    heatmap = gradcam.generate_heatmap(tensor, target_class=target_class)
+    gradcam.remove_hooks()
+
+    overlay_np = forensics.overlay_heatmap(img_np, heatmap)
+    gradcam_b64 = forensics.encode_image_base64(overlay_np)
+    focal_region, focal_intensity = forensics.get_focal_region_description(heatmap)
+
+    fft_data = forensics.analyze_fft_spectrum(img_np)
+    meta_data = forensics.analyze_metadata(image_bytes, "uploaded_image.png")
+
+    report_html = forensics.generate_forensic_report_html(
+        sample_name="Uploaded Image",
+        modality="Image (EfficientNet-B4)",
+        verdict=verdict,
+        confidence=confidence,
+        probabilities={"real": round(real_prob, 4), "fake": round(fake_prob, 4)},
+        gradcam_b64=gradcam_b64,
+        fft_data=fft_data,
+        metadata_data=meta_data
+    )
+    LATEST_EVALUATION["report_html"] = report_html
+
     return {
         "modality": "Image (EfficientNet-B4)",
-        "prediction": "DEEPFAKE" if fake_prob > 0.5 else "REAL",
-        "confidence": round(max(real_prob, fake_prob) * 100, 2),
+        "prediction": verdict,
+        "confidence": confidence,
         "probabilities": {"real": round(real_prob, 4), "fake": round(fake_prob, 4)},
         "feature_dim": features.shape[1],
-        "feature_sample": feat_sample
+        "feature_sample": feat_sample,
+        "forensics": {
+            "gradcam": {
+                "heatmap_base64": gradcam_b64,
+                "focal_region": focal_region,
+                "peak_intensity": focal_intensity,
+                "interpretation": f"Attention focal region: {focal_region} (intensity {focal_intensity:.2f})"
+            },
+            "fft": fft_data,
+            "metadata": meta_data
+        }
     }
 
 def predict_video(video_bytes):
@@ -294,13 +336,15 @@ def predict_video(video_bytes):
 
         indices = np.linspace(0, max(total_frames - 1, 0), NUM_FRAMES).astype(int)
         frames = []
+        raw_frames_rgb = []
         for i in range(total_frames):
             ret, frame = cap.read()
             if not ret:
                 break
             if i in indices:
-                frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                frames.append(frame_transform(frame))
+                frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                raw_frames_rgb.append(frame_rgb)
+                frames.append(frame_transform(frame_rgb))
         cap.release()
 
         if len(frames) == 0:
@@ -308,6 +352,8 @@ def predict_video(video_bytes):
             
         while len(frames) < NUM_FRAMES:
             frames.append(frames[-1])
+            if len(raw_frames_rgb) < NUM_FRAMES:
+                raw_frames_rgb.append(raw_frames_rgb[-1])
             
         tensor = torch.stack(frames[:NUM_FRAMES]).unsqueeze(0).to(device)
         
@@ -318,15 +364,61 @@ def predict_video(video_bytes):
             
         real_prob = float(probs[0].item())
         fake_prob = float(probs[1].item())
+        verdict = "DEEPFAKE" if fake_prob > 0.5 else "REAL"
+        confidence = round(max(real_prob, fake_prob) * 100, 2)
         feat_sample = features[0][:20].cpu().numpy().tolist()
+
+        # Phase 6: XAI & Forensics for Video (Middle Keyframe)
+        mid_idx = len(raw_frames_rgb) // 2
+        keyframe_rgb = raw_frames_rgb[mid_idx]
+        keyframe_tensor = img_transform(Image.fromarray(keyframe_rgb)).unsqueeze(0).to(device)
+
+        target_layer = img_model.backbone.conv_head
+        gradcam = forensics.GradCAM(img_model, target_layer)
+        target_class = 1 if fake_prob > 0.5 else 0
+        heatmap = gradcam.generate_heatmap(keyframe_tensor, target_class=target_class)
+        gradcam.remove_hooks()
+
+        overlay_np = forensics.overlay_heatmap(keyframe_rgb, heatmap)
+        gradcam_b64 = forensics.encode_image_base64(overlay_np)
+        focal_region, focal_intensity = forensics.get_focal_region_description(heatmap)
+
+        fft_data = forensics.analyze_fft_spectrum(keyframe_rgb)
+        consistency_data = forensics.analyze_frame_consistency(raw_frames_rgb)
+        meta_data = forensics.analyze_metadata(video_bytes, "uploaded_video.mp4")
+
+        report_html = forensics.generate_forensic_report_html(
+            sample_name="Uploaded Video",
+            modality="Video (CNN-LSTM)",
+            verdict=verdict,
+            confidence=confidence,
+            probabilities={"real": round(real_prob, 4), "fake": round(fake_prob, 4)},
+            gradcam_b64=gradcam_b64,
+            fft_data=fft_data,
+            consistency_data=consistency_data,
+            metadata_data=meta_data
+        )
+        LATEST_EVALUATION["report_html"] = report_html
         
         return {
             "modality": "Video (CNN-LSTM)",
-            "prediction": "DEEPFAKE" if fake_prob > 0.5 else "REAL",
-            "confidence": round(max(real_prob, fake_prob) * 100, 2),
+            "prediction": verdict,
+            "confidence": confidence,
             "probabilities": {"real": round(real_prob, 4), "fake": round(fake_prob, 4)},
             "feature_dim": features.shape[1],
-            "feature_sample": feat_sample
+            "feature_sample": feat_sample,
+            "forensics": {
+                "gradcam": {
+                    "heatmap_base64": gradcam_b64,
+                    "focal_region": focal_region,
+                    "peak_intensity": focal_intensity,
+                    "interpretation": f"Attention focal region: {focal_region} (intensity {focal_intensity:.2f})"
+                },
+                "fft": fft_data,
+                "ssim": consistency_data,
+                "consistency": consistency_data,
+                "metadata": meta_data
+            }
         }
     finally:
         if os.path.exists(tmp_path):
@@ -372,13 +464,31 @@ def predict_audio(audio_bytes):
         real_prob = float(probs[1].item())
         feat_sample = features[0][:20].cpu().numpy().tolist()
 
+        verdict = "DEEPFAKE" if fake_prob > 0.5 else "REAL"
+        confidence = round(max(real_prob, fake_prob) * 100, 2)
+        meta_data = forensics.analyze_metadata(audio_bytes if audio_bytes else b"", "uploaded_audio.wav")
+        report_html = forensics.generate_forensic_report_html(
+            sample_name="Uploaded Audio Sample",
+            modality="Audio Branch (WavLM Deepfake V2)",
+            verdict=verdict,
+            confidence=confidence,
+            probabilities={"real": round(real_prob, 4), "fake": round(fake_prob, 4)},
+            metadata_data=meta_data
+        )
+        LATEST_EVALUATION["report_html"] = report_html
+
+        forensics_payload = {
+            "metadata": meta_data
+        }
+
         return {
             "modality": "Audio (DavidCombei WavLM Deepfake V2)",
-            "prediction": "DEEPFAKE" if fake_prob > 0.5 else "REAL",
-            "confidence": round(max(real_prob, fake_prob) * 100, 2),
+            "prediction": verdict,
+            "confidence": confidence,
             "probabilities": {"real": round(real_prob, 4), "fake": round(fake_prob, 4)},
             "feature_dim": 768,
-            "feature_sample": feat_sample
+            "feature_sample": feat_sample,
+            "forensics": forensics_payload
         }
     finally:
         if os.path.exists(tmp_path):
@@ -510,22 +620,75 @@ def predict_multimodal(video_bytes, audio_bytes=None):
         pct_audio = round((w_aud / total_w) * 100, 1)
 
         feat_sample = fused_emb[0][:20].cpu().numpy().tolist()
+        verdict = "DEEPFAKE" if fake_prob > 0.5 else "REAL"
+        confidence = round(max(real_prob, fake_prob) * 100, 2)
+
+        # Phase 6: XAI & Forensics for Multimodal
+        mid_idx = len(raw_frames_pil) // 2
+        keyframe_rgb = np.array(raw_frames_pil[mid_idx])
+        keyframe_tensor = img_transform(raw_frames_pil[mid_idx]).unsqueeze(0).to(device)
+
+        target_layer = img_model.backbone.conv_head
+        gradcam = forensics.GradCAM(img_model, target_layer)
+        target_class = 1 if fake_prob > 0.5 else 0
+        heatmap = gradcam.generate_heatmap(keyframe_tensor, target_class=target_class)
+        gradcam.remove_hooks()
+
+        overlay_np = forensics.overlay_heatmap(keyframe_rgb, heatmap)
+        gradcam_b64 = forensics.encode_image_base64(overlay_np)
+        focal_region, focal_intensity = forensics.get_focal_region_description(heatmap)
+
+        fft_data = forensics.analyze_fft_spectrum(keyframe_rgb)
+        raw_frames_rgb = [np.array(p) for p in raw_frames_pil]
+        consistency_data = forensics.analyze_frame_consistency(raw_frames_rgb)
+        lipsync_data = forensics.analyze_lipsync(raw_frames_rgb, wav, SAMPLE_RATE)
+        meta_data = forensics.analyze_metadata(video_bytes if video_bytes else b"", "uploaded_multimodal_video.mp4")
+
+        branch_preds = {
+            "video": {"prediction": "DEEPFAKE" if vid_fake_p > 0.5 else "REAL", "confidence": round(max(vid_fake_p, 1-vid_fake_p)*100, 1)},
+            "audio": {"prediction": "DEEPFAKE" if aud_fake_p > 0.5 else "REAL", "confidence": round(max(aud_fake_p, 1-aud_fake_p)*100, 1)}
+        }
+        attn_dict = {"video": pct_video, "audio": pct_audio}
+
+        report_html = forensics.generate_forensic_report_html(
+            sample_name="Uploaded Multimodal Video",
+            modality="Multimodal Feature Fusion (Video + Audio)",
+            verdict=verdict,
+            confidence=confidence,
+            probabilities={"real": round(real_prob, 4), "fake": round(fake_prob, 4)},
+            branch_predictions=branch_preds,
+            attention_weights=attn_dict,
+            gradcam_b64=gradcam_b64,
+            fft_data=fft_data,
+            consistency_data=consistency_data,
+            metadata_data=meta_data,
+            lipsync_data=lipsync_data
+        )
+        LATEST_EVALUATION["report_html"] = report_html
 
         return {
             "modality": "Multimodal Feature Fusion (Video + Audio)",
-            "prediction": "DEEPFAKE" if fake_prob > 0.5 else "REAL",
-            "confidence": round(max(real_prob, fake_prob) * 100, 2),
+            "prediction": verdict,
+            "confidence": confidence,
             "probabilities": {"real": round(real_prob, 4), "fake": round(fake_prob, 4)},
-            "attention_weights": {
-                "video": pct_video,
-                "audio": pct_audio
-            },
-            "branch_predictions": {
-                "video": {"prediction": "DEEPFAKE" if vid_fake_p > 0.5 else "REAL", "confidence": round(max(vid_fake_p, 1-vid_fake_p)*100, 1)},
-                "audio": {"prediction": "DEEPFAKE" if aud_fake_p > 0.5 else "REAL", "confidence": round(max(aud_fake_p, 1-aud_fake_p)*100, 1)}
-            },
+            "attention_weights": attn_dict,
+            "branch_predictions": branch_preds,
             "feature_dim": fused_emb.shape[1],
-            "feature_sample": feat_sample
+            "feature_sample": feat_sample,
+            "forensics": {
+                "gradcam": {
+                    "heatmap_base64": gradcam_b64,
+                    "focal_region": focal_region,
+                    "peak_intensity": focal_intensity,
+                    "interpretation": f"Attention focal region: {focal_region} (intensity {focal_intensity:.2f})"
+                },
+                "fft": fft_data,
+                "ssim": consistency_data,
+                "consistency": consistency_data,
+                "lip_sync": lipsync_data,
+                "lipsync": lipsync_data,
+                "metadata": meta_data
+            }
         }
     finally:
         if tmp_vid_path and os.path.exists(tmp_vid_path):
@@ -706,13 +869,95 @@ HTML_CONTENT = """<!DOCTYPE html>
         .embedding-box { background: rgba(0,0,0,0.4); padding: 12px; border-radius: 8px; border: 1px solid var(--border-color); }
         .embedding-title { font-size: 0.85rem; font-weight: 600; color: var(--text-muted); margin-bottom: 8px; display: flex; justify-content: space-between; }
         .embedding-bars { display: flex; gap: 3px; height: 35px; align-items: flex-end; }
-        .bar { flex: 1; background: var(--accent-blue); border-radius: 2px; transition: height 0.4s ease; min-height: 4px; }
-
-        .spinner {
-            width: 20px; height: 20px; border: 3px solid rgba(255,255,255,0.3); border-top-color: #fff;
-            border-radius: 50%; animation: spin 0.8s linear infinite; display: none;
+        /* Phase 6: Forensic Workbench & XAI */
+        .btn-dossier {
+            background: linear-gradient(135deg, #10b981 0%, #059669 100%);
+            color: white; border: none; border-radius: 8px;
+            padding: 8px 16px; font-size: 0.85rem; font-weight: 600;
+            cursor: pointer; transition: all 0.2s ease;
+            display: inline-flex; align-items: center; gap: 6px;
+            box-shadow: 0 4px 12px rgba(16, 185, 129, 0.3);
         }
-        @keyframes spin { to { transform: rotate(360deg); } }
+        .btn-dossier:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 6px 16px rgba(16, 185, 129, 0.45);
+        }
+        .forensics-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+            gap: 16px;
+        }
+        .f-card {
+            background: rgba(255, 255, 255, 0.03);
+            border: 1px solid var(--border-color);
+            border-radius: 12px;
+            padding: 14px;
+            display: flex;
+            flex-direction: column;
+        }
+        .f-card-title {
+            font-size: 0.85rem;
+            font-weight: 600;
+            color: #e2e8f0;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 12px;
+            border-bottom: 1px solid rgba(255, 255, 255, 0.05);
+            padding-bottom: 6px;
+        }
+        .f-tag {
+            font-size: 0.68rem;
+            padding: 2px 6px;
+            border-radius: 4px;
+            background: rgba(99, 102, 241, 0.15);
+            color: #a5b4fc;
+            font-weight: 500;
+        }
+        .f-img-preview {
+            max-width: 100%;
+            max-height: 180px;
+            border-radius: 8px;
+            border: 1px solid var(--border-color);
+            box-shadow: 0 4px 10px rgba(0, 0, 0, 0.4);
+            margin-bottom: 10px;
+        }
+        .f-metric-row {
+            display: flex;
+            justify-content: space-between;
+            font-size: 0.8rem;
+            padding: 4px 0;
+            border-bottom: 1px dashed rgba(255, 255, 255, 0.06);
+        }
+        .f-metric-label {
+            color: var(--text-muted);
+        }
+        .f-metric-val {
+            font-weight: 600;
+            color: #f1f5f9;
+        }
+        .f-desc {
+            font-size: 0.75rem;
+            color: var(--text-muted);
+            margin-top: 8px;
+            line-height: 1.35;
+        }
+        .f-ssim-timeline {
+            display: flex;
+            gap: 2px;
+            height: 24px;
+            align-items: flex-end;
+            margin: 8px 0;
+            background: rgba(0, 0, 0, 0.25);
+            padding: 3px;
+            border-radius: 4px;
+        }
+        .f-ssim-bar {
+            flex: 1;
+            background: #10b981;
+            border-radius: 1px;
+            min-height: 2px;
+        }
     </style>
 </head>
 <body>
@@ -849,6 +1094,128 @@ HTML_CONTENT = """<!DOCTYPE html>
                         </div>
                         <div class="embedding-bars" id="embedding-bars">
                             <!-- JS populated bars -->
+                        </div>
+                    </div>
+
+                    <!-- Phase 6: Explainable AI (XAI) & Forensic Workbench -->
+                    <div id="forensics-section" style="display:none; margin-top:24px;">
+                        <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:14px; border-bottom:1px solid var(--border-color); padding-bottom:8px;">
+                            <div>
+                                <h3 style="font-size:1.05rem; color:#fff; display:flex; align-items:center; gap:8px; margin:0;">
+                                    🔍 Explainable AI & Forensic Evidence
+                                </h3>
+                                <p style="font-size:0.75rem; color:var(--text-muted); margin:4px 0 0 0;">
+                                    Grounded in IEEE Survey Literature (Ahmed 2024, Huang 2024, Zhou 2024, Fu 2026)
+                                </p>
+                            </div>
+                            <button class="btn-dossier" onclick="window.open('/api/forensics/report', '_blank')">
+                                📄 Export Forensic Dossier
+                            </button>
+                        </div>
+
+                        <!-- Forensic Evidence Cards Grid -->
+                        <div class="forensics-grid">
+                            <!-- Grad-CAM Card -->
+                            <div class="f-card" id="card-gradcam" style="display:none;">
+                                <div class="f-card-title">
+                                    <span>🔬 Spatial Grad-CAM Attribution</span>
+                                    <span class="f-tag">Ahmed et al. (2024)</span>
+                                </div>
+                                <div class="f-card-body">
+                                    <div style="text-align:center;">
+                                        <img id="f-gradcam-img" src="" alt="Grad-CAM Saliency Map" class="f-img-preview" />
+                                    </div>
+                                    <div class="f-metric-row">
+                                        <span class="f-metric-label">Peak Activation Intensity:</span>
+                                        <span class="f-metric-val" id="f-gradcam-peak">0.00</span>
+                                    </div>
+                                    <p class="f-desc" id="f-gradcam-desc">Attention focal points highlighting manipulation artifacts.</p>
+                                </div>
+                            </div>
+
+                            <!-- 2D FFT Spectrum Card -->
+                            <div class="f-card" id="card-fft" style="display:none;">
+                                <div class="f-card-title">
+                                    <span>📊 2D FFT Frequency Spectrum</span>
+                                    <span class="f-tag">Huang et al. (2024)</span>
+                                </div>
+                                <div class="f-card-body">
+                                    <div style="text-align:center;">
+                                        <img id="f-fft-img" src="" alt="2D FFT Spectrum" class="f-img-preview" />
+                                    </div>
+                                    <div class="f-metric-row">
+                                        <span class="f-metric-label">High-Freq Energy Ratio (HFER):</span>
+                                        <span class="f-metric-val" id="f-fft-ratio">0.000%</span>
+                                    </div>
+                                    <p class="f-desc" id="f-fft-desc">Spectral anomaly detection exposing upsampling / GAN grid artifacts.</p>
+                                </div>
+                            </div>
+
+                            <!-- SSIM Consistency Card (Video / Multimodal) -->
+                            <div class="f-card" id="card-ssim" style="display:none;">
+                                <div class="f-card-title">
+                                    <span>⏱️ Inter-Frame SSIM Consistency</span>
+                                    <span class="f-tag">Zhou et al. (2024)</span>
+                                </div>
+                                <div class="f-card-body">
+                                    <div class="f-metric-row">
+                                        <span class="f-metric-label">Mean Inter-Frame SSIM:</span>
+                                        <span class="f-metric-val" id="f-ssim-mean">1.000</span>
+                                    </div>
+                                    <div class="f-metric-row">
+                                        <span class="f-metric-label">Min SSIM (Peak Jitter):</span>
+                                        <span class="f-metric-val" id="f-ssim-min">1.000</span>
+                                    </div>
+                                    <div class="f-metric-row">
+                                        <span class="f-metric-label">Temporal Variance (&sigma;):</span>
+                                        <span class="f-metric-val" id="f-ssim-var">0.0000</span>
+                                    </div>
+                                    <div class="f-ssim-timeline" id="f-ssim-timeline"></div>
+                                    <p class="f-desc" id="f-ssim-desc">Cross-frame structural consistency measuring facial boundary flicker.</p>
+                                </div>
+                            </div>
+
+                            <!-- Lip-Sync Concordance Card (Multimodal) -->
+                            <div class="f-card" id="card-lipsync" style="display:none;">
+                                <div class="f-card-title">
+                                    <span>👄 Audio-Visual Lip-Sync Concordance</span>
+                                    <span class="f-tag">Fu (2026) / Kim (2025)</span>
+                                </div>
+                                <div class="f-card-body">
+                                    <div class="f-metric-row">
+                                        <span class="f-metric-label">Pearson Correlation (r):</span>
+                                        <span class="f-metric-val" id="f-lipsync-corr">0.000</span>
+                                    </div>
+                                    <div class="f-metric-row">
+                                        <span class="f-metric-label">Concordance Assessment:</span>
+                                        <span class="f-metric-val" id="f-lipsync-status">Synchronized</span>
+                                    </div>
+                                    <p class="f-desc" id="f-lipsync-desc">Cross-modal correlation between acoustic RMS energy and mouth aperture.</p>
+                                </div>
+                            </div>
+
+                            <!-- Metadata & Integrity Card -->
+                            <div class="f-card" id="card-meta">
+                                <div class="f-card-title">
+                                    <span>🔐 Cryptographic & Container Integrity</span>
+                                    <span class="f-tag">Ahmed et al. (2024)</span>
+                                </div>
+                                <div class="f-card-body">
+                                    <div class="f-metric-row">
+                                        <span class="f-metric-label">SHA-256 Fingerprint:</span>
+                                        <span class="f-metric-val" style="font-family:monospace; font-size:0.75rem;" id="f-meta-hash">...</span>
+                                    </div>
+                                    <div class="f-metric-row">
+                                        <span class="f-metric-label">Dimensions / Encoding:</span>
+                                        <span class="f-metric-val" id="f-meta-dims">...</span>
+                                    </div>
+                                    <div class="f-metric-row">
+                                        <span class="f-metric-label">Anomalies Detected:</span>
+                                        <span class="f-metric-val" id="f-meta-anomalies">None</span>
+                                    </div>
+                                    <div id="f-meta-tags" style="font-size:0.75rem; color:var(--text-muted); margin-top:8px; max-height:80px; overflow-y:auto; word-break:break-all;"></div>
+                                </div>
+                            </div>
                         </div>
                     </div>
                 </div>
@@ -1074,6 +1441,96 @@ HTML_CONTENT = """<!DOCTYPE html>
                 bar.title = 'Value: ' + val.toFixed(4);
                 barsContainer.appendChild(bar);
             });
+
+            // Phase 6: Populate Forensics Workbench
+            const fSec = document.getElementById('forensics-section');
+            if (data.forensics) {
+                fSec.style.display = 'block';
+                const f = data.forensics;
+
+                // Grad-CAM Card
+                const cardGrad = document.getElementById('card-gradcam');
+                if (f.gradcam && f.gradcam.heatmap_base64) {
+                    cardGrad.style.display = 'flex';
+                    document.getElementById('f-gradcam-img').src = 'data:image/jpeg;base64,' + f.gradcam.heatmap_base64;
+                    document.getElementById('f-gradcam-peak').innerText = f.gradcam.peak_intensity !== undefined ? f.gradcam.peak_intensity.toFixed(3) : 'N/A';
+                    document.getElementById('f-gradcam-desc').innerText = f.gradcam.interpretation || 'Saliency heatmap highlighting visual artifact regions.';
+                } else {
+                    cardGrad.style.display = 'none';
+                }
+
+                // 2D FFT Card
+                const cardFFT = document.getElementById('card-fft');
+                if (f.fft && f.fft.spectrum_base64) {
+                    cardFFT.style.display = 'flex';
+                    document.getElementById('f-fft-img').src = 'data:image/jpeg;base64,' + f.fft.spectrum_base64;
+                    document.getElementById('f-fft-ratio').innerText = (f.fft.high_freq_ratio * 100).toFixed(3) + '%';
+                    document.getElementById('f-fft-desc').innerText = f.fft.interpretation || 'Frequency domain power spectrum analysis.';
+                } else {
+                    cardFFT.style.display = 'none';
+                }
+
+                // SSIM Consistency Card
+                const cardSSIM = document.getElementById('card-ssim');
+                if (f.ssim && f.ssim.timeline && f.ssim.timeline.length > 0) {
+                    cardSSIM.style.display = 'flex';
+                    document.getElementById('f-ssim-mean').innerText = f.ssim.mean_ssim !== undefined ? f.ssim.mean_ssim.toFixed(4) : 'N/A';
+                    document.getElementById('f-ssim-min').innerText = f.ssim.min_ssim !== undefined ? f.ssim.min_ssim.toFixed(4) : 'N/A';
+                    document.getElementById('f-ssim-var').innerText = f.ssim.variance !== undefined ? f.ssim.variance.toFixed(5) : '0.0000';
+                    document.getElementById('f-ssim-desc').innerText = f.ssim.interpretation || 'Structural similarity consistency across sequential frames.';
+
+                    const tl = document.getElementById('f-ssim-timeline');
+                    tl.innerHTML = '';
+                    f.ssim.timeline.forEach(val => {
+                        const b = document.createElement('div');
+                        b.className = 'f-ssim-bar';
+                        const h = Math.max(10, Math.min(100, Math.round(val * 100)));
+                        b.style.height = h + '%';
+                        b.style.background = val < 0.85 ? '#ef4444' : (val < 0.92 ? '#f59e0b' : '#10b981');
+                        b.title = 'SSIM: ' + val.toFixed(3);
+                        tl.appendChild(b);
+                    });
+                } else {
+                    cardSSIM.style.display = 'none';
+                }
+
+                // Lip-Sync Card
+                const cardLip = document.getElementById('card-lipsync');
+                if (f.lip_sync && f.lip_sync.correlation !== undefined && f.lip_sync.correlation !== null) {
+                    cardLip.style.display = 'flex';
+                    document.getElementById('f-lipsync-corr').innerText = f.lip_sync.correlation.toFixed(3);
+                    const isSync = f.lip_sync.concordant;
+                    const stEl = document.getElementById('f-lipsync-status');
+                    stEl.innerText = isSync ? 'Concordant (Synchronized)' : 'Discordant (Mouth/Speech Mismatch)';
+                    stEl.style.color = isSync ? 'var(--real-green)' : 'var(--fake-red)';
+                    document.getElementById('f-lipsync-desc').innerText = f.lip_sync.interpretation || 'Audio-visual temporal concordance analysis.';
+                } else {
+                    cardLip.style.display = 'none';
+                }
+
+                // Metadata Card
+                const cardMeta = document.getElementById('card-meta');
+                if (f.metadata) {
+                    cardMeta.style.display = 'flex';
+                    document.getElementById('f-meta-hash').innerText = f.metadata.sha256 ? f.metadata.sha256.substring(0, 16) + '...' : 'N/A';
+                    document.getElementById('f-meta-dims').innerText = (f.metadata.dimensions || 'N/A') + (f.metadata.mime_type ? ' (' + f.metadata.mime_type + ')' : '');
+                    const anomCount = (f.metadata.anomalies || []).length;
+                    const anomEl = document.getElementById('f-meta-anomalies');
+                    anomEl.innerText = anomCount === 0 ? 'None (Clean Container)' : anomCount + ' Detected: ' + f.metadata.anomalies.join(', ');
+                    anomEl.style.color = anomCount === 0 ? 'var(--real-green)' : 'var(--fake-red)';
+                    
+                    const tagsEl = document.getElementById('f-meta-tags');
+                    if (f.metadata.exif_tags && Object.keys(f.metadata.exif_tags).length > 0) {
+                        tagsEl.innerText = 'Tags: ' + Object.entries(f.metadata.exif_tags).slice(0, 4).map(([k, v]) => `${k}: ${v}`).join(' | ');
+                    } else {
+                        tagsEl.innerText = 'No suspicious embedded EXIF/container manipulation markers found.';
+                    }
+                } else {
+                    cardMeta.style.display = 'none';
+                }
+            } else {
+                fSec.style.display = 'none';
+            }
         }
     </script>
 </body>
@@ -1094,6 +1551,12 @@ class ForensicRequestHandler(BaseHTTPRequestHandler):
             self.send_header("Content-Type", "text/html; charset=utf-8")
             self.end_headers()
             self.wfile.write(HTML_CONTENT.encode("utf-8"))
+        elif self.path == "/api/forensics/report":
+            report = LATEST_EVALUATION.get("report_html", "<html><body style='font-family:sans-serif;padding:30px;'><h2>No Evaluation Executed Yet</h2><p>Please run a detection first from the workbench.</p></body></html>")
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.end_headers()
+            self.wfile.write(report.encode("utf-8"))
         else:
             self.send_error(404, "File Not Found")
 
