@@ -89,15 +89,17 @@ Media Input --> Preprocessing --> Modality Feature Extractors --> Feature Fusion
     Accuracy: 99.60% | Precision: 99.59% | Recall: 99.59% | F1-Score: 99.59% | ROC-AUC: 0.9999
     Saved model checkpoint: models/multimodal_fusion.pt (5.76 MB).
 
-⏳ PHASE 6: Forensic Analysis Tools, Explainable AI (XAI) & Report Generation
-  - Status: YET TO DO (Final Phase)
-  - Objective: Integrate supplementary forensic checks alongside the deep learning model:
-      1. Metadata Analysis (Exif data, software tags, modification history).
-      2. Frame-Level Consistency Checks (detecting sudden visual jumps or blending artifacts).
-      3. Lip-Sync Alignment Analysis (comparing speech audio timing vs facial lip movement).
-      4. Frequency-Domain Analysis (FFT/DCT spatial & temporal frequency artifact detection).
-      5. Explainable AI (XAI) Heatmaps (saliency regions highlighting manipulated facial areas).
-  - Deliverables: Generate downloadable, comprehensive digital forensic reports.
+✓ PHASE 6: Forensic Analysis Tools, Explainable AI (XAI) & Report Generation
+  - Status: COMPLETED
+  - Grounding: IEEE Research Survey Literature (Ahmed 2024, Huang 2024, Zhou 2024, Fu 2026, Kim 2025)
+  - Deliverables:
+      1. Spatial Grad-CAM Attribution Maps on EfficientNet-B4 conv_head (Ahmed et al., IEEE Access 2024).
+      2. 2D FFT Frequency Power Spectrum & High-Frequency Energy Ratio (Huang et al., IEEE TCSVT 2024).
+      3. Inter-Frame SSIM Temporal Consistency & Jitter Analysis (Zhou et al., IEEE IoT Journal 2024).
+      4. Audio-Visual Lip-Sync Concordance via Acoustic RMS vs Mouth Motion (Fu et al., IEEE TASLP 2026 / Kim et al., IEEE Access 2025).
+      5. Cryptographic SHA-256 Fingerprinting & Container/EXIF Metadata Audit (Ahmed et al., 2024).
+      6. Self-Contained, Printable HTML Digital Forensic Dossier Export (/api/forensics/report).
+      7. Interactive Forensic Workbench integrated in app.py UI.
 
 
 --------------------------------------------------------------------------------
