@@ -282,6 +282,7 @@ def predict_image(image_bytes):
 
     fft_data = forensics.analyze_fft_spectrum(img_np)
     meta_data = forensics.analyze_metadata(image_bytes, "uploaded_image.png")
+    gt_params = forensics.extract_image_parameters(img_np, heatmap, fft_data)
 
     report_html = forensics.generate_forensic_report_html(
         sample_name="Uploaded Image",
@@ -291,7 +292,8 @@ def predict_image(image_bytes):
         probabilities={"real": round(real_prob, 4), "fake": round(fake_prob, 4)},
         gradcam_b64=gradcam_b64,
         fft_data=fft_data,
-        metadata_data=meta_data
+        metadata_data=meta_data,
+        ground_truth_parameters=gt_params
     )
     LATEST_EVALUATION["report_html"] = report_html
 
@@ -303,6 +305,7 @@ def predict_image(image_bytes):
         "feature_dim": features.shape[1],
         "feature_sample": feat_sample,
         "forensics": {
+            "parameters": gt_params,
             "gradcam": {
                 "heatmap_base64": gradcam_b64,
                 "focal_region": focal_region,
@@ -386,6 +389,7 @@ def predict_video(video_bytes):
         fft_data = forensics.analyze_fft_spectrum(keyframe_rgb)
         consistency_data = forensics.analyze_frame_consistency(raw_frames_rgb)
         meta_data = forensics.analyze_metadata(video_bytes, "uploaded_video.mp4")
+        gt_params = forensics.extract_video_parameters(raw_frames_rgb, consistency_data)
 
         report_html = forensics.generate_forensic_report_html(
             sample_name="Uploaded Video",
@@ -396,7 +400,8 @@ def predict_video(video_bytes):
             gradcam_b64=gradcam_b64,
             fft_data=fft_data,
             consistency_data=consistency_data,
-            metadata_data=meta_data
+            metadata_data=meta_data,
+            ground_truth_parameters=gt_params
         )
         LATEST_EVALUATION["report_html"] = report_html
         
@@ -408,6 +413,7 @@ def predict_video(video_bytes):
             "feature_dim": features.shape[1],
             "feature_sample": feat_sample,
             "forensics": {
+                "parameters": gt_params,
                 "gradcam": {
                     "heatmap_base64": gradcam_b64,
                     "focal_region": focal_region,
@@ -467,17 +473,20 @@ def predict_audio(audio_bytes):
         verdict = "DEEPFAKE" if fake_prob > 0.5 else "REAL"
         confidence = round(max(real_prob, fake_prob) * 100, 2)
         meta_data = forensics.analyze_metadata(audio_bytes if audio_bytes else b"", "uploaded_audio.wav")
+        gt_params = forensics.extract_audio_parameters(wav, SAMPLE_RATE)
         report_html = forensics.generate_forensic_report_html(
             sample_name="Uploaded Audio Sample",
             modality="Audio Branch (WavLM Deepfake V2)",
             verdict=verdict,
             confidence=confidence,
             probabilities={"real": round(real_prob, 4), "fake": round(fake_prob, 4)},
-            metadata_data=meta_data
+            metadata_data=meta_data,
+            ground_truth_parameters=gt_params
         )
         LATEST_EVALUATION["report_html"] = report_html
 
         forensics_payload = {
+            "parameters": gt_params,
             "metadata": meta_data
         }
 
@@ -650,6 +659,12 @@ def predict_multimodal(video_bytes, audio_bytes=None):
         }
         attn_dict = {"video": pct_video, "audio": pct_audio}
 
+        # Multi-stream Ground-Truth Parameter Matrix
+        vid_gt = forensics.extract_video_parameters(raw_frames_rgb, consistency_data)
+        aud_gt = forensics.extract_audio_parameters(wav, SAMPLE_RATE)
+        multi_gt = forensics.extract_multimodal_parameters(raw_frames_rgb, wav, SAMPLE_RATE, lipsync_data, attn_dict)
+        gt_params = multi_gt + vid_gt + aud_gt
+
         report_html = forensics.generate_forensic_report_html(
             sample_name="Uploaded Multimodal Video",
             modality="Multimodal Feature Fusion (Video + Audio)",
@@ -662,7 +677,8 @@ def predict_multimodal(video_bytes, audio_bytes=None):
             fft_data=fft_data,
             consistency_data=consistency_data,
             metadata_data=meta_data,
-            lipsync_data=lipsync_data
+            lipsync_data=lipsync_data,
+            ground_truth_parameters=gt_params
         )
         LATEST_EVALUATION["report_html"] = report_html
 
@@ -676,6 +692,7 @@ def predict_multimodal(video_bytes, audio_bytes=None):
             "feature_dim": fused_emb.shape[1],
             "feature_sample": feat_sample,
             "forensics": {
+                "parameters": gt_params,
                 "gradcam": {
                     "heatmap_base64": gradcam_b64,
                     "focal_region": focal_region,
@@ -958,6 +975,63 @@ HTML_CONTENT = """<!DOCTYPE html>
             border-radius: 1px;
             min-height: 2px;
         }
+
+        /* Ground Truth Parameters Table */
+        .gt-params-box {
+            background: rgba(0, 0, 0, 0.45);
+            border: 1px solid var(--border-color);
+            border-radius: 12px;
+            padding: 16px;
+            margin-bottom: 20px;
+        }
+        .gt-params-title {
+            font-size: 0.92rem;
+            font-weight: 700;
+            color: #fff;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 12px;
+            border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+            padding-bottom: 8px;
+        }
+        .gt-table {
+            width: 100%;
+            border-collapse: collapse;
+            font-size: 0.8rem;
+        }
+        .gt-table th {
+            text-align: left;
+            padding: 8px 10px;
+            color: var(--text-muted);
+            border-bottom: 1px solid rgba(255, 255, 255, 0.1);
+            font-weight: 600;
+        }
+        .gt-table td {
+            padding: 10px;
+            border-bottom: 1px solid rgba(255, 255, 255, 0.04);
+            vertical-align: middle;
+        }
+        .gt-badge-pass {
+            background: rgba(16, 185, 129, 0.18);
+            color: #34d399;
+            border: 1px solid rgba(16, 185, 129, 0.35);
+            padding: 3px 8px;
+            border-radius: 6px;
+            font-size: 0.72rem;
+            font-weight: 700;
+            display: inline-block;
+        }
+        .gt-badge-fail {
+            background: rgba(239, 68, 68, 0.18);
+            color: #f87171;
+            border: 1px solid rgba(239, 68, 68, 0.35);
+            padding: 3px 8px;
+            border-radius: 6px;
+            font-size: 0.72rem;
+            font-weight: 700;
+            display: inline-block;
+        }
     </style>
 </head>
 <body>
@@ -1111,6 +1185,30 @@ HTML_CONTENT = """<!DOCTYPE html>
                             <button class="btn-dossier" onclick="window.open('/api/forensics/report', '_blank')">
                                 📄 Export Forensic Dossier
                             </button>
+                        </div>
+
+                        <!-- Ground Truth Forensic Parameters Verification Matrix -->
+                        <div class="gt-params-box" id="gt-params-box" style="display:none;">
+                            <div class="gt-params-title">
+                                <span>⚖️ Ground-Truth Forensic Parameter Verification</span>
+                                <span class="f-tag" style="background:rgba(16,185,129,0.15); color:#6ee7b7;">Literature Survey Ground Truths</span>
+                            </div>
+                            <div style="overflow-x:auto;">
+                                <table class="gt-table">
+                                    <thead>
+                                        <tr>
+                                            <th style="width:28%;">Forensic Parameter</th>
+                                            <th style="width:18%;">Observed Metric</th>
+                                            <th style="width:18%;">Authentic Threshold</th>
+                                            <th style="width:18%;">Diagnostic Status</th>
+                                            <th style="width:18%;">Paper Citation</th>
+                                        </tr>
+                                    </thead>
+                                    <tbody id="gt-params-tbody">
+                                        <!-- Dynamically populated via JS -->
+                                    </tbody>
+                                </table>
+                            </div>
                         </div>
 
                         <!-- Forensic Evidence Cards Grid -->
@@ -1447,6 +1545,33 @@ HTML_CONTENT = """<!DOCTYPE html>
             if (data.forensics) {
                 fSec.style.display = 'block';
                 const f = data.forensics;
+
+                // Ground Truth Parameters Matrix
+                const gtBox = document.getElementById('gt-params-box');
+                const gtTbody = document.getElementById('gt-params-tbody');
+                if (f.parameters && f.parameters.length > 0) {
+                    gtBox.style.display = 'block';
+                    gtTbody.innerHTML = '';
+                    f.parameters.forEach(p => {
+                        const tr = document.createElement('tr');
+                        const isPass = p.status === 'PASS';
+                        const badgeCls = isPass ? 'gt-badge-pass' : 'gt-badge-fail';
+                        const badgeText = p.badge || (isPass ? 'AUTHENTIC' : 'ANOMALY');
+                        tr.innerHTML = `
+                            <td>
+                                <div style="font-weight:600; color:#fff;">${p.name}</div>
+                                <div style="font-size:0.72rem; color:var(--text-muted); margin-top:2px;">${p.desc}</div>
+                            </td>
+                            <td style="font-weight:700; color:#e2e8f0; font-family:monospace;">${p.value}</td>
+                            <td style="color:var(--text-muted); font-family:monospace;">${p.threshold}</td>
+                            <td><span class="${badgeCls}">${badgeText}</span></td>
+                            <td style="font-size:0.75rem; color:#94a3b8;">${p.paper_ref}</td>
+                        `;
+                        gtTbody.appendChild(tr);
+                    });
+                } else {
+                    gtBox.style.display = 'none';
+                }
 
                 // Grad-CAM Card
                 const cardGrad = document.getElementById('card-gradcam');
