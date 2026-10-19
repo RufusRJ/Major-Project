@@ -100,6 +100,7 @@ Media Input --> Preprocessing --> Modality Feature Extractors --> Feature Fusion
       5. Cryptographic SHA-256 Fingerprinting & Container/EXIF Metadata Audit (Ahmed et al., 2024).
       6. Self-Contained, Printable HTML Digital Forensic Dossier Export (/api/forensics/report).
       7. Interactive Forensic Workbench integrated in app.py UI.
+      8. Temporal Deepfake Localization & Timestamp Logs (pinpointing exact manipulated video/audio time intervals).
 
 
 --------------------------------------------------------------------------------

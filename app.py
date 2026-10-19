@@ -337,7 +337,13 @@ def predict_video(video_bytes):
         if total_frames <= 0:
             total_frames = 30
 
+        fps = cap.get(cv2.CAP_PROP_FPS)
+        if not fps or fps <= 0 or np.isnan(fps):
+            fps = 30.0
+        duration_sec = total_frames / fps
         indices = np.linspace(0, max(total_frames - 1, 0), NUM_FRAMES).astype(int)
+        timestamps_sec = [round(float(idx) / fps, 2) for idx in indices[:NUM_FRAMES]]
+
         frames = []
         raw_frames_rgb = []
         for i in range(total_frames):
@@ -391,6 +397,17 @@ def predict_video(video_bytes):
         meta_data = forensics.analyze_metadata(video_bytes, "uploaded_video.mp4")
         gt_params = forensics.extract_video_parameters(raw_frames_rgb, consistency_data)
 
+        # Spatial keyframe deepfake probabilities for temporal timestamp localization
+        with torch.no_grad():
+            batch_imgs = torch.stack([img_transform(Image.fromarray(f)) for f in raw_frames_rgb[:NUM_FRAMES]]).to(device)
+            frame_feats = img_model.extract_features(batch_imgs)
+            frame_logits = img_model.classifier(frame_feats)
+            frame_probs = torch.softmax(frame_logits, dim=1)
+            frame_fake_probs = frame_probs[:, 1].cpu().numpy().tolist()
+
+        ssim_timeline = consistency_data.get("ssim_timeline", [])
+        temporal_loc = forensics.localize_video_temporal_timestamps(timestamps_sec, frame_fake_probs, ssim_timeline, duration_sec, verdict)
+
         report_html = forensics.generate_forensic_report_html(
             sample_name="Uploaded Video",
             modality="Video (CNN-LSTM)",
@@ -401,7 +418,8 @@ def predict_video(video_bytes):
             fft_data=fft_data,
             consistency_data=consistency_data,
             metadata_data=meta_data,
-            ground_truth_parameters=gt_params
+            ground_truth_parameters=gt_params,
+            temporal_localization=temporal_loc
         )
         LATEST_EVALUATION["report_html"] = report_html
         
@@ -414,6 +432,7 @@ def predict_video(video_bytes):
             "feature_sample": feat_sample,
             "forensics": {
                 "parameters": gt_params,
+                "temporal_localization": temporal_loc,
                 "gradcam": {
                     "heatmap_base64": gradcam_b64,
                     "focal_region": focal_region,
@@ -474,6 +493,8 @@ def predict_audio(audio_bytes):
         confidence = round(max(real_prob, fake_prob) * 100, 2)
         meta_data = forensics.analyze_metadata(audio_bytes if audio_bytes else b"", "uploaded_audio.wav")
         gt_params = forensics.extract_audio_parameters(wav, SAMPLE_RATE)
+        duration_sec = len(wav) / SAMPLE_RATE
+        temporal_loc = forensics.localize_audio_temporal_timestamps(wav, SAMPLE_RATE, duration_sec, verdict)
         report_html = forensics.generate_forensic_report_html(
             sample_name="Uploaded Audio Sample",
             modality="Audio Branch (WavLM Deepfake V2)",
@@ -481,12 +502,14 @@ def predict_audio(audio_bytes):
             confidence=confidence,
             probabilities={"real": round(real_prob, 4), "fake": round(fake_prob, 4)},
             metadata_data=meta_data,
-            ground_truth_parameters=gt_params
+            ground_truth_parameters=gt_params,
+            temporal_localization=temporal_loc
         )
         LATEST_EVALUATION["report_html"] = report_html
 
         forensics_payload = {
             "parameters": gt_params,
+            "temporal_localization": temporal_loc,
             "metadata": meta_data
         }
 
@@ -527,7 +550,13 @@ def predict_multimodal(video_bytes, audio_bytes=None):
         if total_frames <= 0:
             total_frames = 30
 
+        fps = cap.get(cv2.CAP_PROP_FPS)
+        if not fps or fps <= 0 or np.isnan(fps):
+            fps = 30.0
+        duration_sec = total_frames / fps
+
         indices = np.linspace(0, max(total_frames - 1, 0), NUM_FRAMES).astype(int)
+        timestamps_sec = [round(float(idx) / fps, 2) for idx in indices[:NUM_FRAMES]]
         raw_frames_pil = []
         frames = []
 
@@ -665,6 +694,17 @@ def predict_multimodal(video_bytes, audio_bytes=None):
         multi_gt = forensics.extract_multimodal_parameters(raw_frames_rgb, wav, SAMPLE_RATE, lipsync_data, attn_dict)
         gt_params = multi_gt + vid_gt + aud_gt
 
+        # Keyframe spatial fake probabilities for temporal localization
+        with torch.no_grad():
+            batch_imgs = torch.stack([img_transform(p) for p in raw_frames_pil[:NUM_FRAMES]]).to(device)
+            frame_feats = img_model.extract_features(batch_imgs)
+            frame_logits = img_model.classifier(frame_feats)
+            frame_probs = torch.softmax(frame_logits, dim=1)
+            frame_fake_probs = frame_probs[:, 1].cpu().numpy().tolist()
+
+        ssim_timeline = consistency_data.get("ssim_timeline", [])
+        temporal_loc = forensics.localize_video_temporal_timestamps(timestamps_sec, frame_fake_probs, ssim_timeline, duration_sec, verdict)
+
         report_html = forensics.generate_forensic_report_html(
             sample_name="Uploaded Multimodal Video",
             modality="Multimodal Feature Fusion (Video + Audio)",
@@ -678,7 +718,8 @@ def predict_multimodal(video_bytes, audio_bytes=None):
             consistency_data=consistency_data,
             metadata_data=meta_data,
             lipsync_data=lipsync_data,
-            ground_truth_parameters=gt_params
+            ground_truth_parameters=gt_params,
+            temporal_localization=temporal_loc
         )
         LATEST_EVALUATION["report_html"] = report_html
 
@@ -693,6 +734,7 @@ def predict_multimodal(video_bytes, audio_bytes=None):
             "feature_sample": feat_sample,
             "forensics": {
                 "parameters": gt_params,
+                "temporal_localization": temporal_loc,
                 "gradcam": {
                     "heatmap_base64": gradcam_b64,
                     "focal_region": focal_region,
@@ -1032,6 +1074,67 @@ HTML_CONTENT = """<!DOCTYPE html>
             font-weight: 700;
             display: inline-block;
         }
+
+        /* Temporal Localization Card */
+        .timeline-container {
+            margin: 14px 0 10px 0;
+        }
+        .timeline-bar-wrapper {
+            position: relative;
+            height: 24px;
+            background: rgba(0, 0, 0, 0.5);
+            border-radius: 6px;
+            border: 1px solid var(--border-color);
+            overflow: hidden;
+            display: flex;
+        }
+        .timeline-seg {
+            height: 100%;
+            transition: all 0.3s ease;
+            position: relative;
+            cursor: pointer;
+        }
+        .timeline-seg-auth {
+            background: #10b981;
+        }
+        .timeline-seg-fake {
+            background: #ef4444;
+            box-shadow: 0 0 10px rgba(239, 68, 68, 0.6);
+        }
+        .timeline-ticks {
+            display: flex;
+            justify-content: space-between;
+            font-size: 0.7rem;
+            color: var(--text-muted);
+            margin-top: 4px;
+            font-family: monospace;
+        }
+        .timestamp-badge-list {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 8px;
+            margin-top: 12px;
+        }
+        .timestamp-badge {
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+            padding: 6px 12px;
+            border-radius: 6px;
+            font-size: 0.78rem;
+            font-family: monospace;
+            font-weight: 600;
+        }
+        .ts-badge-fake {
+            background: rgba(239, 68, 68, 0.18);
+            color: #f87171;
+            border: 1px solid rgba(239, 68, 68, 0.4);
+        }
+        .ts-badge-auth {
+            background: rgba(16, 185, 129, 0.18);
+            color: #34d399;
+            border: 1px solid rgba(16, 185, 129, 0.4);
+        }
     </style>
 </head>
 <body>
@@ -1208,6 +1311,34 @@ HTML_CONTENT = """<!DOCTYPE html>
                                         <!-- Dynamically populated via JS -->
                                     </tbody>
                                 </table>
+                            </div>
+                        </div>
+
+                        <!-- Temporal Deepfake Timestamp Localization Box -->
+                        <div class="gt-params-box" id="temporal-loc-box" style="display:none;">
+                            <div class="gt-params-title">
+                                <span>⏱️ Temporal Deepfake Localization & Timestamp Log</span>
+                                <span class="f-tag" style="background:rgba(239,68,68,0.15); color:#fca5a5;" id="temporal-status-tag">Temporal Analysis</span>
+                            </div>
+                            <p style="font-size:0.8rem; color:var(--text-muted); margin:0 0 10px 0; line-height:1.4;" id="temporal-summary-text">
+                                Frame-by-frame deepfake analysis locating specific manipulation timestamps across the media timeline.
+                            </p>
+                            
+                            <!-- Visual Timeline Bar -->
+                            <div class="timeline-container">
+                                <div class="timeline-bar-wrapper" id="timeline-bar-wrapper">
+                                    <!-- Populated via JS -->
+                                </div>
+                                <div class="timeline-ticks">
+                                    <span>00:00.0</span>
+                                    <span id="timeline-tick-mid">--:--</span>
+                                    <span id="timeline-tick-end">--:--</span>
+                                </div>
+                            </div>
+
+                            <!-- List of localized timestamp intervals -->
+                            <div class="timestamp-badge-list" id="timestamp-badges-container">
+                                <!-- Populated via JS -->
                             </div>
                         </div>
 
@@ -1571,6 +1702,57 @@ HTML_CONTENT = """<!DOCTYPE html>
                     });
                 } else {
                     gtBox.style.display = 'none';
+                }
+
+                // Temporal Deepfake Timestamp Localization
+                const timeBox = document.getElementById('temporal-loc-box');
+                if (f.temporal_localization && f.temporal_localization.timeline && f.temporal_localization.timeline.length > 0) {
+                    timeBox.style.display = 'block';
+                    const tl = f.temporal_localization;
+                    const hasFake = tl.has_manipulated_segments;
+                    
+                    const tag = document.getElementById('temporal-status-tag');
+                    tag.innerText = hasFake ? '⚠️ Manipulation Localized' : '✅ 100% Authentic Timeline';
+                    tag.style.background = hasFake ? 'rgba(239,68,68,0.18)' : 'rgba(16,185,129,0.18)';
+                    tag.style.color = hasFake ? '#f87171' : '#34d399';
+
+                    document.getElementById('temporal-summary-text').innerText = tl.summary || '';
+                    document.getElementById('timeline-tick-end').innerText = tl.total_duration_str || '00:00.0';
+                    const midSec = (tl.total_duration_sec || 0) / 2;
+                    const midM = Math.floor(midSec / 60);
+                    const midS = (midSec % 60).toFixed(1);
+                    document.getElementById('timeline-tick-mid').innerText = (midM < 10 ? '0' : '') + midM + ':' + (midS < 10 ? '0' : '') + midS;
+
+                    // Build visual timeline scrub bar
+                    const barWrap = document.getElementById('timeline-bar-wrapper');
+                    barWrap.innerHTML = '';
+                    const frames = tl.timeline;
+                    frames.forEach(fr => {
+                        const seg = document.createElement('div');
+                        seg.className = 'timeline-seg ' + (fr.status === 'MANIPULATED' ? 'timeline-seg-fake' : 'timeline-seg-auth');
+                        seg.style.flex = '1';
+                        seg.title = fr.timestamp + ' — ' + fr.status + ' (' + fr.score + '% confidence)';
+                        barWrap.appendChild(seg);
+                    });
+
+                    // Build timestamp interval badges
+                    const badgesWrap = document.getElementById('timestamp-badges-container');
+                    badgesWrap.innerHTML = '';
+                    if (tl.segments && tl.segments.length > 0) {
+                        tl.segments.forEach(seg => {
+                            const badge = document.createElement('div');
+                            badge.className = 'timestamp-badge ts-badge-fake';
+                            badge.innerHTML = `<span>🔴 <b>${seg.interval}</b> (${seg.duration}s) — ${seg.label} [${seg.confidence}% Conf]</span>`;
+                            badgesWrap.appendChild(badge);
+                        });
+                    } else {
+                        const badge = document.createElement('div');
+                        badge.className = 'timestamp-badge ts-badge-auth';
+                        badge.innerHTML = `<span>🟢 <b>00:00.0 - ${tl.total_duration_str}</b> — Fully Authentic (No Deepfake Detected)</span>`;
+                        badgesWrap.appendChild(badge);
+                    }
+                } else {
+                    timeBox.style.display = 'none';
                 }
 
                 // Grad-CAM Card
