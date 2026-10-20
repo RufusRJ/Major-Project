@@ -246,6 +246,58 @@ frame_transform = T.Compose([
 SAMPLE_RATE = CFG["audio"]["sample_rate"]
 MAX_SAMPLES = SAMPLE_RATE * CFG["audio"]["max_audio_seconds"]
 
+# Face Detection & Container Audio Extraction Helpers
+face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
+
+def extract_audio_from_video(video_path):
+    """
+    Extracts 16kHz mono audio from video container via imageio-ffmpeg.
+    Handles MP4, AVI, MOV containers reliably on Windows.
+    """
+    try:
+        import imageio_ffmpeg, subprocess, soundfile as sf
+        ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
+        with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as tmp_wav_f:
+            tmp_wav_path = tmp_wav_f.name
+        cmd = [ffmpeg_exe, '-y', '-i', video_path, '-vn', '-ac', '1', '-ar', str(SAMPLE_RATE), tmp_wav_path]
+        res = subprocess.run(cmd, capture_output=True)
+        if res.returncode == 0 and os.path.exists(tmp_wav_path) and os.path.getsize(tmp_wav_path) > 1000:
+            full_wav, _ = sf.read(tmp_wav_path)
+            try:
+                os.remove(tmp_wav_path)
+            except Exception:
+                pass
+            return full_wav.astype(np.float32)
+        if os.path.exists(tmp_wav_path):
+            try:
+                os.remove(tmp_wav_path)
+            except Exception:
+                pass
+    except Exception as e:
+        print(f"[Audio Extraction Notice] {e}")
+    return None
+
+def extract_face_crop_rgb(frame_bgr):
+    """
+    Crops the dominant face from a video frame with a 20% margin.
+    If no face is detected, returns the full frame in RGB.
+    """
+    try:
+        gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
+        faces = face_cascade.detectMultiScale(gray, 1.2, 5)
+        if len(faces) > 0:
+            x, y, w, h = faces[0]
+            pad = int(0.20 * max(w, h))
+            y1 = max(0, y - pad)
+            y2 = min(frame_bgr.shape[0], y + h + pad)
+            x1 = max(0, x - pad)
+            x2 = min(frame_bgr.shape[1], x + w + pad)
+            crop = frame_bgr[y1:y2, x1:x2]
+            return cv2.cvtColor(crop, cv2.COLOR_BGR2RGB)
+    except Exception:
+        pass
+    return cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+
 # ==============================================================================
 # Helper Inference Functions
 # ==============================================================================
@@ -398,15 +450,58 @@ def predict_video(video_bytes):
         gt_params = forensics.extract_video_parameters(raw_frames_rgb, consistency_data)
 
         # Spatial keyframe deepfake probabilities for temporal timestamp localization
+        # Uses 32 frames with face-crop detection for precise spatial facial artifact localization
+        N_LOC = 32
+        loc_indices = np.linspace(0, max(total_frames - 1, 0), N_LOC).astype(int)
+        loc_timestamps_sec = [round(float(idx) / fps, 2) for idx in loc_indices]
+        
+        cap_loc = cv2.VideoCapture(tmp_path)
+        loc_crops = []
+        loc_ssims = [1.0]
+        prev_f = None
+        for idx in loc_indices:
+            cap_loc.set(cv2.CAP_PROP_POS_FRAMES, idx)
+            ret, fr = cap_loc.read()
+            if not ret or fr is None:
+                continue
+            fr_rgb = cv2.cvtColor(fr, cv2.COLOR_BGR2RGB)
+            if prev_f is not None:
+                loc_ssims.append(forensics.compute_ssim_fast(prev_f, fr_rgb))
+            prev_f = fr_rgb
+            crop_rgb = extract_face_crop_rgb(fr)
+            loc_crops.append(Image.fromarray(crop_rgb))
+        cap_loc.release()
+
+        while len(loc_crops) < N_LOC:
+            loc_crops.append(loc_crops[-1])
+        while len(loc_ssims) < len(loc_crops):
+            loc_ssims.append(1.0)
+
         with torch.no_grad():
-            batch_imgs = torch.stack([img_transform(Image.fromarray(f)) for f in raw_frames_rgb[:NUM_FRAMES]]).to(device)
+            batch_imgs = torch.stack([img_transform(p) for p in loc_crops[:N_LOC]]).to(device)
             frame_feats = img_model.extract_features(batch_imgs)
             frame_logits = img_model.classifier(frame_feats)
             frame_probs = torch.softmax(frame_logits, dim=1)
             frame_fake_probs = frame_probs[:, 1].cpu().numpy().tolist()
 
-        ssim_timeline = consistency_data.get("ssim_timeline", [])
-        temporal_loc = forensics.localize_video_temporal_timestamps(timestamps_sec, frame_fake_probs, ssim_timeline, duration_sec, verdict)
+        temporal_loc = forensics.localize_video_temporal_timestamps(
+            loc_timestamps_sec, frame_fake_probs, loc_ssims, duration_sec, verdict,
+            overall_confidence=confidence, overall_fake_prob=fake_prob
+        )
+
+        # Video-only temporal localization
+        manip_segs = [s for s in temporal_loc.get("segments", []) if s.get("status") == "MANIPULATED"]
+        if fake_prob > 0.5:
+            verdict = "DEEPFAKE"
+            confidence = round(fake_prob * 100, 2)
+        elif any(s.get("duration", 0) >= 3.0 for s in manip_segs):
+            verdict = "DEEPFAKE"
+            fake_prob = max(fake_prob, max(s.get("confidence", 50)/100.0 for s in manip_segs))
+            real_prob = 1.0 - fake_prob
+            confidence = round(fake_prob * 100, 2)
+        else:
+            verdict = "REAL"
+            confidence = round(real_prob * 100, 2)
 
         report_html = forensics.generate_forensic_report_html(
             sample_name="Uploaded Video",
@@ -459,42 +554,71 @@ def predict_audio(audio_bytes):
 
     try:
         try:
-            wav, _ = librosa.load(tmp_path, sr=SAMPLE_RATE, mono=True)
+            full_wav, _ = librosa.load(tmp_path, sr=SAMPLE_RATE, mono=True)
         except Exception:
             raise ValueError("Invalid audio file format. Please upload a valid WAV, MP3, or FLAC audio file.")
 
-        if len(wav) == 0:
+        if len(full_wav) == 0:
             raise ValueError("Audio file is empty or unreadable.")
 
-        if len(wav) > MAX_SAMPLES:
-            wav = wav[:MAX_SAMPLES]
-        else:
-            wav = np.pad(wav, (0, MAX_SAMPLES - len(wav)))
-        wav = wav.astype(np.float32)
-        
-        inputs = audio_processor(wav, sampling_rate=SAMPLE_RATE, return_tensors="pt")
+        full_wav = full_wav.astype(np.float32)
+        total_audio_sec = len(full_wav) / SAMPLE_RATE
+
+        # Full-duration sliding chunk evaluation with WavLM
+        chunk_sec = 4
+        hop_sec = 2
+        chunk_samples = chunk_sec * SAMPLE_RATE
+        hop_samples = hop_sec * SAMPLE_RATE
+
+        audio_chunks = []
+        chunk_times = []
+        for st in range(0, max(1, len(full_wav) - chunk_samples + 1), hop_samples):
+            sub = full_wav[st:st + chunk_samples]
+            if len(sub) < chunk_samples:
+                sub = np.pad(sub, (0, chunk_samples - len(sub)))
+            audio_chunks.append(sub)
+            chunk_times.append(st / SAMPLE_RATE)
+
+        if len(audio_chunks) == 0:
+            audio_chunks = [np.pad(full_wav, (0, max(0, chunk_samples - len(full_wav))))[:chunk_samples]]
+            chunk_times = [0.0]
+
+        inputs = audio_processor(audio_chunks, sampling_rate=SAMPLE_RATE, return_tensors="pt", padding=True)
         input_values = inputs.input_values.to(device)
-        
+
         with torch.no_grad():
             outputs = aud_model(input_values, output_hidden_states=True)
             logits = outputs.logits
-            probs = torch.softmax(logits, dim=1)[0]
+            probs = torch.softmax(logits, dim=1)
+            # DavidCombei mapping: Index 0 = FAKE, Index 1 = REAL
+            chunk_fake_probs = probs[:, 0].cpu().numpy().tolist()
+            max_fake_idx = int(np.argmax(chunk_fake_probs))
+            fake_prob = float(chunk_fake_probs[max_fake_idx])
+            real_prob = 1.0 - fake_prob
+
             if hasattr(outputs, "hidden_states") and outputs.hidden_states is not None:
-                features = outputs.hidden_states[-1].mean(dim=1)
+                features = outputs.hidden_states[-1][max_fake_idx:max_fake_idx+1].mean(dim=1)
             else:
                 features = torch.zeros(1, 768, device=device)
 
-        # DavidCombei mapping: Index 0 = FAKE, Index 1 = REAL
-        fake_prob = float(probs[0].item())
-        real_prob = float(probs[1].item())
         feat_sample = features[0][:20].cpu().numpy().tolist()
-
         verdict = "DEEPFAKE" if fake_prob > 0.5 else "REAL"
         confidence = round(max(real_prob, fake_prob) * 100, 2)
         meta_data = forensics.analyze_metadata(audio_bytes if audio_bytes else b"", "uploaded_audio.wav")
-        gt_params = forensics.extract_audio_parameters(wav, SAMPLE_RATE)
-        duration_sec = len(wav) / SAMPLE_RATE
-        temporal_loc = forensics.localize_audio_temporal_timestamps(wav, SAMPLE_RATE, duration_sec, verdict)
+        gt_params = forensics.extract_audio_parameters(full_wav[:MAX_SAMPLES], SAMPLE_RATE)
+
+        temporal_loc = forensics.localize_audio_temporal_timestamps(
+            full_wav, SAMPLE_RATE, total_audio_sec, verdict,
+            overall_confidence=confidence, overall_fake_prob=fake_prob,
+            chunk_fake_probs=chunk_fake_probs, chunk_times_sec=chunk_times
+        )
+
+        if temporal_loc.get("has_manipulated_segments", False):
+            verdict = "DEEPFAKE"
+            fake_prob = max(fake_prob, 0.55)
+            real_prob = 1.0 - fake_prob
+            confidence = round(fake_prob * 100, 2)
+
         report_html = forensics.generate_forensic_report_html(
             sample_name="Uploaded Audio Sample",
             modality="Audio Branch (WavLM Deepfake V2)",
@@ -592,40 +716,66 @@ def predict_multimodal(video_bytes, audio_bytes=None):
         with torch.no_grad():
             f_img = img_model.extract_features(img_tensor)
 
-        # 3. Extract Audio Features (F_audio)
-        wav = None
+        # 3. Extract Audio Features across Full File (F_audio)
+        full_wav = None
         if audio_bytes and len(audio_bytes) > 0:
             with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmp_a:
                 tmp_a.write(audio_bytes)
                 tmp_aud_path = tmp_a.name
             try:
-                wav, _ = librosa.load(tmp_aud_path, sr=SAMPLE_RATE, mono=True)
+                full_wav, _ = librosa.load(tmp_aud_path, sr=SAMPLE_RATE, mono=True)
             except Exception:
-                wav = None
+                full_wav = None
 
-        if wav is None:
-            try:
-                wav, _ = librosa.load(tmp_vid_path, sr=SAMPLE_RATE, mono=True)
-            except Exception:
-                wav = np.zeros(MAX_SAMPLES, dtype=np.float32)
+        if full_wav is None:
+            full_wav = extract_audio_from_video(tmp_vid_path)
+            if full_wav is None:
+                try:
+                    full_wav, _ = librosa.load(tmp_vid_path, sr=SAMPLE_RATE, mono=True)
+                except Exception:
+                    full_wav = np.zeros(MAX_SAMPLES, dtype=np.float32)
 
-        if len(wav) == 0:
-            wav = np.zeros(MAX_SAMPLES, dtype=np.float32)
-        elif len(wav) > MAX_SAMPLES:
-            wav = wav[:MAX_SAMPLES]
-        else:
-            wav = np.pad(wav, (0, MAX_SAMPLES - len(wav)))
-        wav = wav.astype(np.float32)
+        if len(full_wav) == 0:
+            full_wav = np.zeros(MAX_SAMPLES, dtype=np.float32)
 
-        inputs = audio_processor(wav, sampling_rate=SAMPLE_RATE, return_tensors="pt")
+        full_wav = full_wav.astype(np.float32)
+        total_audio_sec = len(full_wav) / SAMPLE_RATE
+
+        # Full-duration sliding chunk evaluation with WavLM
+        chunk_sec = 4
+        hop_sec = 2
+        chunk_samples = chunk_sec * SAMPLE_RATE
+        hop_samples = hop_sec * SAMPLE_RATE
+
+        audio_chunks = []
+        chunk_times = []
+        for st in range(0, max(1, len(full_wav) - chunk_samples + 1), hop_samples):
+            sub = full_wav[st:st + chunk_samples]
+            if len(sub) < chunk_samples:
+                sub = np.pad(sub, (0, chunk_samples - len(sub)))
+            audio_chunks.append(sub)
+            chunk_times.append(st / SAMPLE_RATE)
+
+        if len(audio_chunks) == 0:
+            audio_chunks = [np.pad(full_wav, (0, max(0, chunk_samples - len(full_wav))))[:chunk_samples]]
+            chunk_times = [0.0]
+
+        inputs = audio_processor(audio_chunks, sampling_rate=SAMPLE_RATE, return_tensors="pt", padding=True)
         input_values = inputs.input_values.to(device)
         with torch.no_grad():
             outputs = aud_model(input_values, output_hidden_states=True)
             aud_logits = outputs.logits
-            aud_probs = torch.softmax(aud_logits, dim=1)[0]
-            aud_fake_p = float(aud_probs[0].item()) # Index 0 = FAKE in DavidCombei
+            aud_probs = torch.softmax(aud_logits, dim=1)
+            # DavidCombei: Index 0 = FAKE, Index 1 = REAL
+            chunk_fake_probs = aud_probs[:, 0].cpu().numpy().tolist()
+            max_fake_idx = int(np.argmax(chunk_fake_probs))
+            aud_fake_p = float(chunk_fake_probs[max_fake_idx])
+
             if hasattr(outputs, "hidden_states") and outputs.hidden_states is not None:
-                f_aud = outputs.hidden_states[-1].mean(dim=1)
+                if aud_fake_p > 0.5:
+                    f_aud = outputs.hidden_states[-1][max_fake_idx:max_fake_idx+1].mean(dim=1)
+                else:
+                    f_aud = outputs.hidden_states[-1].mean(dim=1).mean(dim=0, keepdim=True)
             else:
                 f_aud = torch.zeros(1, 768, device=device)
 
@@ -638,16 +788,6 @@ def predict_multimodal(video_bytes, audio_bytes=None):
         raw_real_prob = float(fusion_probs[0].item())
         raw_fake_prob = float(fusion_probs[1].item())
 
-        # Forensic Security Gating Rule:
-        # In media forensics, if ANY individual stream (Video or Audio) is detected as DEEPFAKE (> 50%),
-        # the overall file is compromised and MUST be flagged as DEEPFAKE.
-        if vid_fake_p > 0.5 or aud_fake_p > 0.5:
-            fake_prob = max(raw_fake_prob, vid_fake_p if vid_fake_p > 0.5 else 0.0, aud_fake_p if aud_fake_p > 0.5 else 0.0)
-            real_prob = 1.0 - fake_prob
-        else:
-            real_prob = raw_real_prob
-            fake_prob = raw_fake_prob
-
         w_img = float(attn_weights[0, 0].item())
         w_vid = float(attn_weights[0, 1].item())
         w_aud = float(attn_weights[0, 2].item())
@@ -658,8 +798,6 @@ def predict_multimodal(video_bytes, audio_bytes=None):
         pct_audio = round((w_aud / total_w) * 100, 1)
 
         feat_sample = fused_emb[0][:20].cpu().numpy().tolist()
-        verdict = "DEEPFAKE" if fake_prob > 0.5 else "REAL"
-        confidence = round(max(real_prob, fake_prob) * 100, 2)
 
         # Phase 6: XAI & Forensics for Multimodal
         mid_idx = len(raw_frames_pil) // 2
@@ -668,7 +806,7 @@ def predict_multimodal(video_bytes, audio_bytes=None):
 
         target_layer = img_model.backbone.conv_head
         gradcam = forensics.GradCAM(img_model, target_layer)
-        target_class = 1 if fake_prob > 0.5 else 0
+        target_class = 1 if (raw_fake_prob > 0.5 or vid_fake_p > 0.5 or aud_fake_p > 0.5) else 0
         heatmap = gradcam.generate_heatmap(keyframe_tensor, target_class=target_class)
         gradcam.remove_hooks()
 
@@ -679,31 +817,102 @@ def predict_multimodal(video_bytes, audio_bytes=None):
         fft_data = forensics.analyze_fft_spectrum(keyframe_rgb)
         raw_frames_rgb = [np.array(p) for p in raw_frames_pil]
         consistency_data = forensics.analyze_frame_consistency(raw_frames_rgb)
-        lipsync_data = forensics.analyze_lipsync(raw_frames_rgb, wav, SAMPLE_RATE)
+        lipsync_data = forensics.analyze_lipsync(raw_frames_rgb, full_wav[:MAX_SAMPLES], SAMPLE_RATE)
         meta_data = forensics.analyze_metadata(video_bytes if video_bytes else b"", "uploaded_multimodal_video.mp4")
 
-        branch_preds = {
-            "video": {"prediction": "DEEPFAKE" if vid_fake_p > 0.5 else "REAL", "confidence": round(max(vid_fake_p, 1-vid_fake_p)*100, 1)},
-            "audio": {"prediction": "DEEPFAKE" if aud_fake_p > 0.5 else "REAL", "confidence": round(max(aud_fake_p, 1-aud_fake_p)*100, 1)}
-        }
         attn_dict = {"video": pct_video, "audio": pct_audio}
 
         # Multi-stream Ground-Truth Parameter Matrix
         vid_gt = forensics.extract_video_parameters(raw_frames_rgb, consistency_data)
-        aud_gt = forensics.extract_audio_parameters(wav, SAMPLE_RATE)
-        multi_gt = forensics.extract_multimodal_parameters(raw_frames_rgb, wav, SAMPLE_RATE, lipsync_data, attn_dict)
+        aud_gt = forensics.extract_audio_parameters(full_wav[:MAX_SAMPLES], SAMPLE_RATE)
+        multi_gt = forensics.extract_multimodal_parameters(raw_frames_rgb, full_wav[:MAX_SAMPLES], SAMPLE_RATE, lipsync_data, attn_dict)
         gt_params = multi_gt + vid_gt + aud_gt
 
         # Keyframe spatial fake probabilities for temporal localization
+        # Use 32-sample timeline with face-crop detection for accurate artifact localization
+        N_LOC = 32
+        loc_indices = np.linspace(0, max(total_frames - 1, 0), N_LOC).astype(int)
+        loc_timestamps_sec = [round(float(idx) / fps, 2) for idx in loc_indices]
+        
+        cap_loc = cv2.VideoCapture(tmp_vid_path)
+        loc_crops = []
+        loc_ssims = [1.0]
+        prev_f = None
+        for idx in loc_indices:
+            cap_loc.set(cv2.CAP_PROP_POS_FRAMES, idx)
+            ret, fr = cap_loc.read()
+            if not ret or fr is None:
+                continue
+            fr_rgb = cv2.cvtColor(fr, cv2.COLOR_BGR2RGB)
+            if prev_f is not None:
+                loc_ssims.append(forensics.compute_ssim_fast(prev_f, fr_rgb))
+            prev_f = fr_rgb
+            crop_rgb = extract_face_crop_rgb(fr)
+            loc_crops.append(Image.fromarray(crop_rgb))
+        cap_loc.release()
+
+        while len(loc_crops) < N_LOC:
+            loc_crops.append(loc_crops[-1])
+        while len(loc_ssims) < len(loc_crops):
+            loc_ssims.append(1.0)
+
         with torch.no_grad():
-            batch_imgs = torch.stack([img_transform(p) for p in raw_frames_pil[:NUM_FRAMES]]).to(device)
+            batch_imgs = torch.stack([img_transform(p) for p in loc_crops[:N_LOC]]).to(device)
             frame_feats = img_model.extract_features(batch_imgs)
             frame_logits = img_model.classifier(frame_feats)
             frame_probs = torch.softmax(frame_logits, dim=1)
             frame_fake_probs = frame_probs[:, 1].cpu().numpy().tolist()
 
-        ssim_timeline = consistency_data.get("ssim_timeline", [])
-        temporal_loc = forensics.localize_video_temporal_timestamps(timestamps_sec, frame_fake_probs, ssim_timeline, duration_sec, verdict)
+        video_temporal_loc = forensics.localize_video_temporal_timestamps(
+            loc_timestamps_sec, frame_fake_probs, loc_ssims, duration_sec,
+            "DEEPFAKE" if vid_fake_p > 0.5 else "REAL",
+            overall_confidence=round(max(vid_fake_p, 1-vid_fake_p)*100, 1),
+            overall_fake_prob=vid_fake_p
+        )
+        audio_temporal_loc = forensics.localize_audio_temporal_timestamps(
+            full_wav, SAMPLE_RATE, total_audio_sec,
+            "DEEPFAKE" if aud_fake_p > 0.5 else "REAL",
+            overall_confidence=round(max(aud_fake_p, 1-aud_fake_p)*100, 1),
+            overall_fake_prob=aud_fake_p,
+            chunk_fake_probs=chunk_fake_probs,
+            chunk_times_sec=chunk_times
+        )
+
+        branch_preds = {
+            "video": {
+                "prediction": "DEEPFAKE" if (vid_fake_p > 0.5 or video_temporal_loc.get("has_manipulated_segments", False)) else "REAL",
+                "confidence": round(max(vid_fake_p, 1-vid_fake_p)*100, 1)
+            },
+            "audio": {
+                "prediction": "DEEPFAKE" if (aud_fake_p > 0.5 or audio_temporal_loc.get("has_manipulated_segments", False)) else "REAL",
+                "confidence": round(max(aud_fake_p, 1-aud_fake_p)*100, 1)
+            }
+        }
+
+        # Forensic Security Gating Rule:
+        # If ANY individual stream or temporal segment is detected as DEEPFAKE, file is DEEPFAKE
+        has_temporal_manip = (
+            video_temporal_loc.get("has_manipulated_segments", False) or 
+            audio_temporal_loc.get("has_manipulated_segments", False)
+        )
+        if vid_fake_p > 0.5 or aud_fake_p > 0.5 or has_temporal_manip:
+            max_p = max(
+                raw_fake_prob, vid_fake_p, aud_fake_p,
+                max(frame_fake_probs) if frame_fake_probs else 0.0,
+                max(chunk_fake_probs) if chunk_fake_probs else 0.0
+            )
+            fake_prob = max_p
+            real_prob = 1.0 - fake_prob
+            verdict = "DEEPFAKE"
+        else:
+            real_prob = raw_real_prob
+            fake_prob = raw_fake_prob
+            verdict = "REAL"
+        confidence = round(max(real_prob, fake_prob) * 100, 2)
+
+        temporal_loc = forensics.localize_multimodal_temporal(
+            video_temporal_loc, audio_temporal_loc, verdict, confidence
+        )
 
         report_html = forensics.generate_forensic_report_html(
             sample_name="Uploaded Multimodal Video",
@@ -1233,6 +1442,48 @@ HTML_CONTENT = """<!DOCTYPE html>
                         <div class="conf-badge" id="conf-badge">94.2% Confident</div>
                     </div>
 
+                    <!-- Temporal Deepfake Timestamp Localization Box (Positioned directly below classification result) -->
+                    <div class="gt-params-box" id="temporal-loc-box" style="display:none; margin-top:16px;">
+                        <div class="gt-params-title">
+                            <span>⏱️ Temporal Deepfake Localization & Timestamp Log</span>
+                            <span class="f-tag" style="background:rgba(239,68,68,0.15); color:#fca5a5;" id="temporal-status-tag">Temporal Analysis</span>
+                        </div>
+                        <p style="font-size:0.8rem; color:var(--text-muted); margin:0 0 10px 0; line-height:1.4;" id="temporal-summary-text">
+                            Frame-by-frame deepfake analysis locating specific manipulation timestamps across the media timeline.
+                        </p>
+                        
+                        <!-- Visual Timeline Bar -->
+                        <div class="timeline-container" id="timeline-container-vid">
+                            <div style="font-size:0.75rem; color:#94a3b8; font-weight:600; margin-bottom:4px; display:none;" id="timeline-vid-label">📹 Visual Video Stream</div>
+                            <div class="timeline-bar-wrapper" id="timeline-bar-wrapper">
+                                <!-- Populated via JS -->
+                            </div>
+                            <div class="timeline-ticks">
+                                <span>00:00.0</span>
+                                <span id="timeline-tick-mid">--:--</span>
+                                <span id="timeline-tick-end">--:--</span>
+                            </div>
+                        </div>
+
+                        <!-- Audio Timeline Bar (Multimodal) -->
+                        <div class="timeline-container" id="timeline-container-aud" style="display:none; margin-top:12px;">
+                            <div style="font-size:0.75rem; color:#94a3b8; font-weight:600; margin-bottom:4px;">🎙️ Acoustic Audio Stream</div>
+                            <div class="timeline-bar-wrapper" id="audio-timeline-bar-wrapper">
+                                <!-- Populated via JS -->
+                            </div>
+                            <div class="timeline-ticks">
+                                <span>00:00.0</span>
+                                <span id="audio-timeline-tick-mid">--:--</span>
+                                <span id="audio-timeline-tick-end">--:--</span>
+                            </div>
+                        </div>
+
+                        <!-- List of localized timestamp intervals -->
+                        <div class="timestamp-badge-list" id="timestamp-badges-container">
+                            <!-- Populated via JS -->
+                        </div>
+                    </div>
+
                     <!-- Multimodal Cross-Attention Weighting (Phase 5: Video + Audio) -->
                     <div class="attention-box" id="attention-box">
                         <div style="font-size:0.85rem; font-weight:600; color:var(--text-muted); margin-bottom:10px; display:flex; justify-content:space-between;">
@@ -1311,34 +1562,6 @@ HTML_CONTENT = """<!DOCTYPE html>
                                         <!-- Dynamically populated via JS -->
                                     </tbody>
                                 </table>
-                            </div>
-                        </div>
-
-                        <!-- Temporal Deepfake Timestamp Localization Box -->
-                        <div class="gt-params-box" id="temporal-loc-box" style="display:none;">
-                            <div class="gt-params-title">
-                                <span>⏱️ Temporal Deepfake Localization & Timestamp Log</span>
-                                <span class="f-tag" style="background:rgba(239,68,68,0.15); color:#fca5a5;" id="temporal-status-tag">Temporal Analysis</span>
-                            </div>
-                            <p style="font-size:0.8rem; color:var(--text-muted); margin:0 0 10px 0; line-height:1.4;" id="temporal-summary-text">
-                                Frame-by-frame deepfake analysis locating specific manipulation timestamps across the media timeline.
-                            </p>
-                            
-                            <!-- Visual Timeline Bar -->
-                            <div class="timeline-container">
-                                <div class="timeline-bar-wrapper" id="timeline-bar-wrapper">
-                                    <!-- Populated via JS -->
-                                </div>
-                                <div class="timeline-ticks">
-                                    <span>00:00.0</span>
-                                    <span id="timeline-tick-mid">--:--</span>
-                                    <span id="timeline-tick-end">--:--</span>
-                                </div>
-                            </div>
-
-                            <!-- List of localized timestamp intervals -->
-                            <div class="timestamp-badge-list" id="timestamp-badges-container">
-                                <!-- Populated via JS -->
                             </div>
                         </div>
 
@@ -1712,9 +1935,32 @@ HTML_CONTENT = """<!DOCTYPE html>
                     const hasFake = tl.has_manipulated_segments;
                     
                     const tag = document.getElementById('temporal-status-tag');
-                    tag.innerText = hasFake ? '⚠️ Manipulation Localized' : '✅ 100% Authentic Timeline';
-                    tag.style.background = hasFake ? 'rgba(239,68,68,0.18)' : 'rgba(16,185,129,0.18)';
-                    tag.style.color = hasFake ? '#f87171' : '#34d399';
+                    if (tl.is_multimodal) {
+                        const vidFake = tl.video && tl.video.has_manipulated_segments;
+                        const audFake = tl.audio && tl.audio.has_manipulated_segments;
+                        if (vidFake && audFake) {
+                            tag.innerText = '⚠️ Video & Audio Manipulated';
+                            tag.style.background = 'rgba(239,68,68,0.2)';
+                            tag.style.color = '#f87171';
+                        } else if (vidFake) {
+                            tag.innerText = '⚠️ Visual Deepfake Localized';
+                            tag.style.background = 'rgba(239,68,68,0.18)';
+                            tag.style.color = '#f87171';
+                        } else if (audFake) {
+                            tag.innerText = '⚠️ Acoustic Speech Synthesized';
+                            tag.style.background = 'rgba(239,68,68,0.18)';
+                            tag.style.color = '#f87171';
+                        } else {
+                            tag.innerText = '✅ 100% Authentic Multimodal Media';
+                            tag.style.background = 'rgba(16,185,129,0.18)';
+                            tag.style.color = '#34d399';
+                        }
+                    } else {
+                        const isContinuous = hasFake && tl.segments && tl.segments.length === 1 && (tl.segments[0].label.includes('Continuous') || tl.segments[0].duration >= 0.85 * (tl.total_duration_sec || 1));
+                        tag.innerText = isContinuous ? '⚠️ Deepfake Throughout Timeline' : (hasFake ? '⚠️ Manipulation Localized' : '✅ 100% Authentic Timeline');
+                        tag.style.background = hasFake ? 'rgba(239,68,68,0.18)' : 'rgba(16,185,129,0.18)';
+                        tag.style.color = hasFake ? '#f87171' : '#34d399';
+                    }
 
                     document.getElementById('temporal-summary-text').innerText = tl.summary || '';
                     document.getElementById('timeline-tick-end').innerText = tl.total_duration_str || '00:00.0';
@@ -1726,7 +1972,7 @@ HTML_CONTENT = """<!DOCTYPE html>
                     // Build visual timeline scrub bar
                     const barWrap = document.getElementById('timeline-bar-wrapper');
                     barWrap.innerHTML = '';
-                    const frames = tl.timeline;
+                    const frames = tl.timeline || [];
                     frames.forEach(fr => {
                         const seg = document.createElement('div');
                         seg.className = 'timeline-seg ' + (fr.status === 'MANIPULATED' ? 'timeline-seg-fake' : 'timeline-seg-auth');
@@ -1735,14 +1981,41 @@ HTML_CONTENT = """<!DOCTYPE html>
                         barWrap.appendChild(seg);
                     });
 
+                    // Multimodal audio timeline bar handling
+                    const audContainer = document.getElementById('timeline-container-aud');
+                    const vidLabel = document.getElementById('timeline-vid-label');
+                    if (tl.is_multimodal && tl.audio && tl.audio.timeline && tl.audio.timeline.length > 0) {
+                        vidLabel.style.display = 'block';
+                        audContainer.style.display = 'block';
+                        const audBarWrap = document.getElementById('audio-timeline-bar-wrapper');
+                        audBarWrap.innerHTML = '';
+                        tl.audio.timeline.forEach(fr => {
+                            const seg = document.createElement('div');
+                            seg.className = 'timeline-seg ' + (fr.status === 'MANIPULATED' ? 'timeline-seg-fake' : 'timeline-seg-auth');
+                            seg.style.flex = '1';
+                            seg.title = fr.timestamp + ' — ' + fr.status + ' (' + fr.score + '% confidence)';
+                            audBarWrap.appendChild(seg);
+                        });
+                        document.getElementById('audio-timeline-tick-end').innerText = tl.audio.total_duration_str || '00:00.0';
+                        const aMidSec = (tl.audio.total_duration_sec || 0) / 2;
+                        const aMidM = Math.floor(aMidSec / 60);
+                        const aMidS = (aMidSec % 60).toFixed(1);
+                        document.getElementById('audio-timeline-tick-mid').innerText = (aMidM < 10 ? '0' : '') + aMidM + ':' + (aMidS < 10 ? '0' : '') + aMidS;
+                    } else {
+                        vidLabel.style.display = 'none';
+                        audContainer.style.display = 'none';
+                    }
+
                     // Build timestamp interval badges
                     const badgesWrap = document.getElementById('timestamp-badges-container');
                     badgesWrap.innerHTML = '';
                     if (tl.segments && tl.segments.length > 0) {
                         tl.segments.forEach(seg => {
                             const badge = document.createElement('div');
-                            badge.className = 'timestamp-badge ts-badge-fake';
-                            badge.innerHTML = `<span>🔴 <b>${seg.interval}</b> (${seg.duration}s) — ${seg.label} [${seg.confidence}% Conf]</span>`;
+                            const isFake = seg.status === 'MANIPULATED';
+                            badge.className = 'timestamp-badge ' + (isFake ? 'ts-badge-fake' : 'ts-badge-auth');
+                            const icon = isFake ? '🔴' : '🟢';
+                            badge.innerHTML = `<span>${icon} <b>${seg.interval}</b> (${seg.duration}s) — ${seg.label} [${seg.confidence}% Conf]</span>`;
                             badgesWrap.appendChild(badge);
                         });
                     } else {
@@ -1837,6 +2110,7 @@ HTML_CONTENT = """<!DOCTYPE html>
                 }
             } else {
                 fSec.style.display = 'none';
+                document.getElementById('temporal-loc-box').style.display = 'none';
             }
         }
     </script>

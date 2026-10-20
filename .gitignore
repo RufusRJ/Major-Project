@@ -21,6 +21,10 @@ models/*_backup.pt
 .cache/
 .DS_Store
 *.log
-*_backup.pt
+# Test media & scratch
+scratch/
+*.mp4
+*.avi
+*.mov
 
 
