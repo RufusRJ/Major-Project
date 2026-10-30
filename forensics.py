@@ -956,17 +956,8 @@ def localize_video_temporal_timestamps(timestamps_sec, frame_fake_probs, ssim_va
                 "details": "Spatial facial artifact concentration and temporal boundary instability detected."
             })
 
-        # In a single continuous video (no scene cuts), if the sequence model confirms authentic/REAL,
-        # isolated frame artifact fluctuations are visual noise and must not create false manipulated segments
-        if p_seq < 0.50 or overall_verdict == "REAL":
-            manipulated_segments = []
-            for item in timeline:
-                item["status"] = "AUTHENTIC"
-                item["score"] = round((100.0 - item["score"]), 1) if item["score"] > 50 else item["score"]
-        else:
-            manipulated_segments = [s for s in manipulated_segments if s.get("duration", 0) >= 1.2]
-
-        has_fake = len(manipulated_segments) > 0
+        # Any frame or cluster with deepfake artifacts forms a manipulated segment
+        has_fake = len(manipulated_segments) > 0 or any(item.get("status") == "MANIPULATED" for item in timeline)
         all_segments = build_comprehensive_intervals(manipulated_segments, total_duration_sec, media_type="video")
 
     if has_fake:
@@ -1154,8 +1145,8 @@ def localize_multimodal_temporal(video_temporal_loc, audio_temporal_loc, overall
     Fuses video and audio temporal localization streams for multimodal deepfake detection.
     Correctly isolates whether visual track, audio track, or both contain manipulation.
     """
-    vid_fake = video_temporal_loc.get("has_manipulated_segments", False)
-    aud_fake = audio_temporal_loc.get("has_manipulated_segments", False)
+    vid_fake = video_temporal_loc.get("has_manipulated_segments", False) or any(fr.get("status") == "MANIPULATED" for fr in video_temporal_loc.get("timeline", []))
+    aud_fake = audio_temporal_loc.get("has_manipulated_segments", False) or any(fr.get("status") == "MANIPULATED" for fr in audio_temporal_loc.get("timeline", []))
     has_any = vid_fake or aud_fake
 
     # Summary generator
